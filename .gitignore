@@ -1,0 +1,45 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python cache
+**/__pycache__/
+*.py[cod]
+
+# Logs / temp
+*.log
+*.tmp
+*.swp
+
+# =========================
+# Dataset exclusions
+# =========================
+# BIRD datasets (very large)
+EAGLE-main/eagle/bird/
+# Other packaged data used for training/eval
+EAGLE-main/eagle/data/
+
+# Common local dataset file types
+**/*.sqlite
+**/*.sqlite3
+**/*.db
+**/*.parquet
+**/*.arrow
+**/*.feather
+
+# =========================
+# Model / checkpoint exclusions
+# =========================
+/model/
+/models/
+/checkpoints/
+**/checkpoint-*/
+**/state_*/
+
+# Common model weight formats
+**/*.safetensors
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.bin
+**/*.onnx
