@@ -244,12 +244,29 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
         token = token[None, None]
     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
 
-    # Clone the output hidden states
+    # Clone and reshape hidden states for EAGLE3.
+    # cnets.Model.fc expects 3 * hidden_size as input features.
     if model.use_eagle3:
         ea_device = model.ea_layer.lm_head.weight.device
-        if outputs["hidden_states"][0].device != ea_device:
-            outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
-        hidden_states=torch.cat(outputs["hidden_states"],dim=-1)
+        try:
+            hs = list(outputs["hidden_states"])
+        except Exception:
+            hs = []
+        if hs:
+            # Match traineagle3/cnets.py dataprepare(): teacher hidden_states[0:3]
+            hs = hs[:3] if len(hs) >= 3 else hs
+            if hs[0].device != ea_device:
+                hs = [x.to(ea_device) for x in hs]
+            hidden_states = torch.cat(hs, dim=-1)
+        else:
+            hidden_states = hidden_states.to(ea_device)
+        expected_in = getattr(getattr(model.ea_layer, "fc", None), "in_features", None)
+        if expected_in is not None and hidden_states.shape[-1] != int(expected_in):
+            raise RuntimeError(
+                f"EAGLE3 hidden_states feature mismatch in initialize_tree: "
+                f"got={hidden_states.shape[-1]} expected={int(expected_in)} "
+                f"(teacher hidden selection should match training dataprepare hs[0:3])."
+            )
     draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
 
@@ -323,9 +340,25 @@ def tree_decoding(
 
     if model.use_eagle3:
         ea_device = model.ea_layer.lm_head.weight.device
-        if outputs["hidden_states"][0].device != ea_device:
-            outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
-        hidden_state = torch.cat(outputs["hidden_states"], dim=-1)
+        try:
+            hs = list(outputs["hidden_states"])
+        except Exception:
+            hs = []
+        if hs:
+            # Match traineagle3/cnets.py dataprepare(): teacher hidden_states[0:3]
+            hs = hs[:3] if len(hs) >= 3 else hs
+            if hs[0].device != ea_device:
+                hs = [x.to(ea_device) for x in hs]
+            hidden_state = torch.cat(hs, dim=-1)
+        else:
+            hidden_state = hidden_state.to(ea_device)
+        expected_in = getattr(getattr(model.ea_layer, "fc", None), "in_features", None)
+        if expected_in is not None and hidden_state.shape[-1] != int(expected_in):
+            raise RuntimeError(
+                f"EAGLE3 hidden_state feature mismatch in tree_decoding: "
+                f"got={hidden_state.shape[-1]} expected={int(expected_in)} "
+                f"(teacher hidden selection should match training dataprepare hs[0:3])."
+            )
 
     logits = tree_logits[0, retrieve_indices]
     return logits, hidden_state, outputs

@@ -60,6 +60,13 @@ _CHECKPOINT_FOR_DOC = "Qwen/Qwen2-7B-beta"
 _CONFIG_FOR_DOC = "Qwen2Config"
 
 
+_NUM_GUARD_CLAMP = 1.0e4
+
+
+def _nan_guard_tensor(x: torch.Tensor, *, nan: float = 0.0, pos: float = _NUM_GUARD_CLAMP, neg: float = -_NUM_GUARD_CLAMP):
+    return torch.nan_to_num(x, nan=nan, posinf=pos, neginf=neg)
+
+
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Qwen2
 class Qwen2RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -101,6 +108,47 @@ class Qwen2RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (base_theta ** (torch.arange(0, dim, 2).float().to(device) / dim))
         attention_scaling = 1.0
         return inv_freq, attention_scaling
+
+    @staticmethod
+    def _sanitize_rope_params(
+            inv_freq: torch.Tensor,
+            attention_scaling: float,
+            config: Optional[Qwen2Config],
+            rope_kwargs: dict,
+            device,
+    ):
+        fallback = False
+        try:
+            inv_ok = bool(torch.isfinite(inv_freq).all().item())
+        except Exception:
+            inv_ok = False
+        if not inv_ok:
+            fallback = True
+
+        try:
+            scale = float(attention_scaling)
+        except Exception:
+            fallback = True
+            scale = 1.0
+
+        if not math.isfinite(scale) or abs(scale) < 1e-8:
+            fallback = True
+            scale = 1.0
+        elif abs(scale) > 64.0:
+            logger.warning_once(
+                f"RoPE attention_scaling={scale} looks abnormal; clamp to 1.0 for numerical stability."
+            )
+            scale = 1.0
+
+        if fallback:
+            logger.warning_once(
+                "Detected invalid RoPE parameters from config/registry; "
+                "fallback to classic RoPE (theta-based, attention_scaling=1.0)."
+            )
+            inv_freq, _ = Qwen2RotaryEmbedding._build_classic_inv_freq(config, rope_kwargs, device)
+            scale = 1.0
+
+        return inv_freq, scale
 
     def __init__(
             self,
@@ -194,6 +242,13 @@ class Qwen2RotaryEmbedding(nn.Module):
                 "Falling back to classic RoPE parameterization."
             )
             inv_freq, self.attention_scaling = self._build_classic_inv_freq(self.config, self.rope_kwargs, device)
+        inv_freq, self.attention_scaling = self._sanitize_rope_params(
+            inv_freq,
+            self.attention_scaling,
+            self.config,
+            self.rope_kwargs,
+            device,
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
@@ -235,6 +290,29 @@ class Qwen2RotaryEmbedding(nn.Module):
         # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
         cos = cos * self.attention_scaling
         sin = sin * self.attention_scaling
+
+        if not torch.isfinite(cos).all() or not torch.isfinite(sin).all():
+            logger.warning_once(
+                "Non-finite RoPE embeddings detected at runtime; "
+                "switching to classic RoPE parameters for stability."
+            )
+            inv_freq, _ = self._build_classic_inv_freq(self.config, self.rope_kwargs, x.device)
+            inv_freq, self.attention_scaling = self._sanitize_rope_params(
+                inv_freq,
+                1.0,
+                self.config,
+                self.rope_kwargs,
+                x.device,
+            )
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+            self.original_inv_freq = self.inv_freq
+            inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+            position_ids_expanded = position_ids[:, None, :].float()
+            with torch.autocast(device_type=device_type, enabled=False):
+                freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+                emb = torch.cat((freqs, freqs), dim=-1)
+                cos = emb.cos()
+                sin = emb.sin()
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
@@ -381,26 +459,38 @@ class Qwen2Attention(nn.Module):
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            # key_states, value_states = past_key_value.cat(key_states, value_states, self.layer_idx)
-            past_key, past_value = past_key_value[self.layer_idx]
-            key_states = past_key.cat(key_states)
-            value_states = past_value.cat(value_states)
-        past_key_value = None
+            if hasattr(past_key_value, "update"):
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+            else:
+                # Legacy/custom EAGLE KVCache path
+                past_key, past_value = past_key_value[self.layer_idx]
+                key_states = past_key.cat(key_states)
+                value_states = past_value.cat(value_states)
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+        query_states = _nan_guard_tensor(query_states)
+        key_states = _nan_guard_tensor(key_states)
+        value_states = _nan_guard_tensor(value_states)
+
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            mask_min = torch.finfo(causal_mask.dtype).min if causal_mask.is_floating_point() else -_NUM_GUARD_CLAMP
+            causal_mask = _nan_guard_tensor(causal_mask, nan=mask_min, pos=0.0, neg=mask_min)
             attn_weights = attn_weights + causal_mask
+        attn_weights = _nan_guard_tensor(attn_weights)
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = _nan_guard_tensor(attn_weights)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = _nan_guard_tensor(attn_output)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -472,7 +562,22 @@ class Qwen2FlashAttention2(Qwen2Attention):
 
         if past_key_value is not None:
             # Activate slicing cache only if the config has a value `sliding_windows` attribute
-            cache_has_contents = past_key_value.get_seq_length[self.layer_idx][0].current_length.item() > 0
+            cache_has_contents = True
+            try:
+                if hasattr(past_key_value, "get_seq_length"):
+                    try:
+                        seq_len = past_key_value.get_seq_length(self.layer_idx)
+                    except TypeError:
+                        seq_len = past_key_value.get_seq_length()
+                    cache_has_contents = int(seq_len) > 0
+                else:
+                    pkey = past_key_value[self.layer_idx][0]
+                    if hasattr(pkey, "current_length"):
+                        cache_has_contents = int(pkey.current_length.item()) > 0
+                    else:
+                        cache_has_contents = int(pkey.shape[-2]) > 0
+            except Exception:
+                cache_has_contents = True
             kv_seq_len = key_states.shape[-2] + cache_position[0]
             if (
                     getattr(self.config, "sliding_window", None) is not None
@@ -498,11 +603,21 @@ class Qwen2FlashAttention2(Qwen2Attention):
                     attention_mask = torch.cat([attention_mask, torch.ones_like(attention_mask[:, -1:])], dim=-1)
 
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            if hasattr(past_key_value, "update"):
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+            else:
+                past_key, past_value = past_key_value[self.layer_idx]
+                key_states = past_key.cat(key_states)
+                value_states = past_value.cat(value_states)
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+        query_states = _nan_guard_tensor(query_states)
+        key_states = _nan_guard_tensor(key_states)
+        value_states = _nan_guard_tensor(value_states)
         dropout_rate = 0.0 if not self.training else self.attention_dropout
 
         # In PEFT, usually we cast the layer norms in float32 for training stability reasons
@@ -532,6 +647,9 @@ class Qwen2FlashAttention2(Qwen2Attention):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
+        query_states = _nan_guard_tensor(query_states)
+        key_states = _nan_guard_tensor(key_states)
+        value_states = _nan_guard_tensor(value_states)
 
         if (
                 self.config.use_sliding_window
@@ -555,6 +673,7 @@ class Qwen2FlashAttention2(Qwen2Attention):
             use_top_left_mask=self._flash_attn_uses_top_left_mask,
         )
 
+        attn_output = _nan_guard_tensor(attn_output)
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
 
@@ -622,19 +741,27 @@ class Qwen2SdpaAttention(Qwen2Attention):
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            # key_states, value_states = past_key_value.cat(key_states, value_states, self.layer_idx)
-            past_key, past_value = past_key_value[self.layer_idx]
-            key_states = past_key.cat(key_states)
-            value_states = past_value.cat(value_states)
-        past_key_value = None
+            if hasattr(past_key_value, "update"):
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+            else:
+                # Legacy/custom EAGLE KVCache path
+                past_key, past_value = past_key_value[self.layer_idx]
+                key_states = past_key.cat(key_states)
+                value_states = past_value.cat(value_states)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+        query_states = _nan_guard_tensor(query_states)
+        key_states = _nan_guard_tensor(key_states)
+        value_states = _nan_guard_tensor(value_states)
 
         causal_mask = attention_mask
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            mask_min = torch.finfo(causal_mask.dtype).min if causal_mask.is_floating_point() else -_NUM_GUARD_CLAMP
+            causal_mask = _nan_guard_tensor(causal_mask, nan=mask_min, pos=0.0, neg=mask_min)
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -656,6 +783,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
             is_causal=is_causal,
         )
 
+        attn_output = _nan_guard_tensor(attn_output)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
 
@@ -910,6 +1038,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             os.environ.get("EAGLE_ENABLE_SDPA_MASK_AUTO_IGNORE", "0") == "1"
         )
         self._sdpa_mask_ignore_warned = False
+        self._sdpa_unmask_warned = False
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -918,6 +1047,49 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
+
+    @staticmethod
+    def _get_past_seen_tokens(past_key_values) -> int:
+        """Best-effort cache length extraction for both legacy and new Cache APIs."""
+        if past_key_values is None:
+            return 0
+
+        # Legacy/custom cache path used by EAGLE KVCache list.
+        try:
+            if isinstance(past_key_values, (list, tuple)) and len(past_key_values) > 0:
+                first = past_key_values[0]
+                if isinstance(first, (list, tuple)) and len(first) > 0:
+                    first = first[0]
+                if hasattr(first, "current_length"):
+                    cur = first.current_length
+                    return int(cur.item() if hasattr(cur, "item") else cur)
+                if hasattr(first, "shape"):
+                    return int(first.shape[-2])
+        except Exception:
+            pass
+
+        # New Transformers Cache API (DynamicCache/StaticCache/etc.).
+        try:
+            if hasattr(past_key_values, "get_seq_length"):
+                try:
+                    seq_len = past_key_values.get_seq_length()
+                except TypeError:
+                    seq_len = past_key_values.get_seq_length(0)
+                if isinstance(seq_len, (list, tuple)):
+                    seq_len = seq_len[0] if seq_len else 0
+                return int(seq_len.item() if hasattr(seq_len, "item") else seq_len)
+        except Exception:
+            pass
+
+        # Some cache classes expose `seen_tokens`.
+        try:
+            if hasattr(past_key_values, "seen_tokens"):
+                st = past_key_values.seen_tokens
+                return int(st.item() if hasattr(st, "item") else st)
+        except Exception:
+            pass
+
+        return 0
 
     @add_start_docstrings_to_model_forward(QWEN2_INPUTS_DOCSTRING)
     def forward(
@@ -971,7 +1143,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if cache_position is None:
-            past_seen_tokens = past_key_values[0][0].current_length.item() if past_key_values is not None else 0
+            past_seen_tokens = self._get_past_seen_tokens(past_key_values)
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
@@ -1021,6 +1193,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
+            hidden_states = _nan_guard_tensor(hidden_states)
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
@@ -1128,7 +1301,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
         # to infer the attention mask.
 
-        past_seen_tokens = past_key_values[0][0].current_length.item() if past_key_values is not None else 0
+        past_seen_tokens = self._get_past_seen_tokens(past_key_values)
         using_static_cache = isinstance(past_key_values, StaticCache)
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
 
@@ -1187,7 +1360,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
             # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
             # Details: https://github.com/pytorch/pytorch/issues/110213
-            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+            try:
+                causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+            except TypeError as e:
+                # Some Transformers builds have a malformed warning_once signature
+                # inside this helper; skip this optimization path for stability.
+                if not self._sdpa_unmask_warned:
+                    print(f"WARN: skip `_unmask_unattended` due compatibility issue: {e}")
+                    self._sdpa_unmask_warned = True
 
         return causal_mask
 
@@ -1296,7 +1476,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             )
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         # TODO: remove the float() operation in v4.46
+        hidden_states = _nan_guard_tensor(hidden_states)
         logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :]).float()
+        logits = _nan_guard_tensor(logits, nan=0.0, pos=_NUM_GUARD_CLAMP, neg=-_NUM_GUARD_CLAMP)
 
         loss = None
         if labels is not None:

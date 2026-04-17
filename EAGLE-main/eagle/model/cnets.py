@@ -566,9 +566,25 @@ class Model(nn.Module):
             param.requires_grad = False
 
     def init_tree(self):
-        self.tree_mask_init = torch.eye(self.top_k, device=self.embed_tokens.weight.device)[None, None]
-        self.position_ids = torch.zeros(self.top_k, device=self.embed_tokens.weight.device, dtype=torch.long)
-        self.tree_mask_init = self.tree_mask_init.to(self.embed_tokens.weight.device)
+        device = self.embed_tokens.weight.device
+        tree_mask_init = torch.eye(self.top_k, device=device)[None, None]
+        position_ids = torch.zeros(self.top_k, device=device, dtype=torch.long)
+
+        # Keep these tensors as buffers so .to(device) and checkpoint/device
+        # transitions remain consistent across generation calls.
+        if "tree_mask_init" not in self._buffers:
+            if hasattr(self, "tree_mask_init"):
+                delattr(self, "tree_mask_init")
+            self.register_buffer("tree_mask_init", tree_mask_init, persistent=False)
+        else:
+            self.tree_mask_init = tree_mask_init
+
+        if "position_ids" not in self._buffers:
+            if hasattr(self, "position_ids"):
+                delattr(self, "position_ids")
+            self.register_buffer("position_ids", position_ids, persistent=False)
+        else:
+            self.position_ids = position_ids
 
     def reset(self):
         self.tree_mask = None
@@ -691,7 +707,8 @@ class Model(nn.Module):
     @torch.no_grad()
     def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
 
-        input_ids = input_ids.to(hidden_states.device)
+        device = hidden_states.device
+        input_ids = input_ids.to(device)
         total_tokens = self.total_tokens
         depth = self.depth
         top_k = self.top_k
@@ -703,7 +720,7 @@ class Model(nn.Module):
         ss_token = []
 
         input_ids = input_ids[:, 1:]
-        input_ids = input_ids.to(hidden_states.device)
+        input_ids = input_ids.to(device)
 
         len_posi = input_ids.shape[1]
         self.reset()
@@ -734,13 +751,15 @@ class Model(nn.Module):
             ss_token.append(topk_index+self.d2t[topk_index])
             input_ids = topk_index+self.d2t[topk_index]
         input_hidden = last_hidden[None].repeat(1, top_k, 1)
-        tree_mask = self.tree_mask_init
-        topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
+        # tree buffers are plain tensors (not registered buffers), so they may stay
+        # on CPU even after model.to(cuda). Force device alignment per call.
+        tree_mask = self.tree_mask_init.to(device)
+        topk_cs_index = torch.arange(top_k, device=device)
 
         # 4
         for i in range(depth):
             self.tree_mask = tree_mask
-            position_ids = len_posi + self.position_ids
+            position_ids = len_posi + self.position_ids.to(device)
             # with Timer("draft one"):
             out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
                                                position_ids=position_ids, use_cache=True)
@@ -776,7 +795,7 @@ class Model(nn.Module):
                 input_ids = input_ids + self.d2t[input_ids]
                 ss_token.append(topk_index+self.d2t[topk_index])
             scores_list.append(cu_scores)
-            tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
+            tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init.to(device)), dim=3)
 
 
         scores_list = torch.cat(scores_list, dim=0).view(-1)

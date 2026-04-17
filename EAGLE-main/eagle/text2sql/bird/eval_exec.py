@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import signal
 import sqlite3
 import time
@@ -22,6 +23,23 @@ class ExecResult:
     rows: list[tuple[Any, ...]] | None = None
     error: str | None = None
     elapsed_sec: float = 0.0
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(out):
+        return default
+    return out
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -159,6 +177,13 @@ def main() -> None:
         "ex_denominator": 0,
         "exec_accuracy": 0.0,
         "pred_executable_rate": 0.0,
+        "acceptance_samples": 0,
+        "acceptance_rate_mean": 0.0,
+        "acceptance_rate_token_weighted": 0.0,
+        "accepted_tokens_sum": 0,
+        "proposed_tokens_sum": 0,
+        "wall_time_samples": 0,
+        "wall_time_avg_sec": 0.0,
         "failure_breakdown": {},
         "settings": {
             "timeout_sec": args.timeout_sec,
@@ -168,9 +193,27 @@ def main() -> None:
     }
 
     failures: list[dict[str, Any]] = []
+    acceptance_rate_sum = 0.0
+    wall_time_sum = 0.0
 
     for pr in preds:
         summary["total_preds"] += 1
+        acceptance_rate = _safe_float(pr.get("acceptance_rate"), default=-1.0)
+        if acceptance_rate >= 0.0:
+            summary["acceptance_samples"] += 1
+            acceptance_rate_sum += acceptance_rate
+
+        accepted_tokens = max(0, _safe_int(pr.get("accepted_tokens"), default=0))
+        proposed_tokens = max(0, _safe_int(pr.get("proposed_tokens"), default=0))
+        if proposed_tokens > 0:
+            summary["accepted_tokens_sum"] += accepted_tokens
+            summary["proposed_tokens_sum"] += proposed_tokens
+
+        wall_time = _safe_float(pr.get("wall_time"), default=-1.0)
+        if wall_time >= 0.0:
+            summary["wall_time_samples"] += 1
+            wall_time_sum += wall_time
+
         qid = str(pr.get("question_id"))
         sample = questions.get(qid)
         if sample is None:
@@ -255,6 +298,14 @@ def main() -> None:
         summary["exec_accuracy"] = summary["ex_matches"] / summary["ex_denominator"]
     if summary["db_found"] > 0:
         summary["pred_executable_rate"] = summary["pred_exec_ok"] / summary["db_found"]
+    if summary["acceptance_samples"] > 0:
+        summary["acceptance_rate_mean"] = acceptance_rate_sum / summary["acceptance_samples"]
+    if summary["proposed_tokens_sum"] > 0:
+        summary["acceptance_rate_token_weighted"] = (
+            summary["accepted_tokens_sum"] / summary["proposed_tokens_sum"]
+        )
+    if summary["wall_time_samples"] > 0:
+        summary["wall_time_avg_sec"] = wall_time_sum / summary["wall_time_samples"]
 
     out_summary = Path(args.output_summary_json)
     out_fail = Path(args.output_failures_jsonl)
@@ -283,6 +334,16 @@ def main() -> None:
         f.write(f"- EX matches: {summary['ex_matches']}\n")
         f.write(f"- Execution Accuracy (EX): {summary['exec_accuracy']:.4f}\n")
         f.write(f"- Pred executable rate: {summary['pred_executable_rate']:.4f}\n")
+        f.write(f"- Acceptance rate (sample mean): {summary['acceptance_rate_mean']:.4f}\n")
+        f.write(
+            f"- Acceptance rate (token-weighted): "
+            f"{summary['acceptance_rate_token_weighted']:.4f}\n"
+        )
+        f.write(
+            f"- Accepted / Proposed tokens: "
+            f"{summary['accepted_tokens_sum']} / {summary['proposed_tokens_sum']}\n"
+        )
+        f.write(f"- Avg wall time per sample (sec): {summary['wall_time_avg_sec']:.4f}\n")
 
         f.write("\n## Settings\n\n")
         f.write(f"- timeout_sec: {summary['settings']['timeout_sec']}\n")
@@ -302,6 +363,11 @@ def main() -> None:
     print(json.dumps({
         "exec_accuracy": summary["exec_accuracy"],
         "pred_executable_rate": summary["pred_executable_rate"],
+        "acceptance_rate_mean": summary["acceptance_rate_mean"],
+        "acceptance_rate_token_weighted": summary["acceptance_rate_token_weighted"],
+        "accepted_tokens_sum": summary["accepted_tokens_sum"],
+        "proposed_tokens_sum": summary["proposed_tokens_sum"],
+        "wall_time_avg_sec": summary["wall_time_avg_sec"],
         "ex_matches": summary["ex_matches"],
         "ex_denominator": summary["ex_denominator"],
         "summary_json": str(out_summary),

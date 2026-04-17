@@ -73,7 +73,212 @@ class EaModel(nn.Module):
             self.ea_layer.diff_device = False
         if self.use_eagle3 and config.vocab_size==config.draft_vocab_size:
             del self.ea_layer.d2t,self.ea_layer.t2d
-        load_=self.ea_layer.load_state_dict(ea_layer_state_dict, strict=False)
+        def _try_load_with_optional_prefix_strip(state_dict):
+            target_keys = set(self.ea_layer.state_dict().keys())
+
+            def _load(sd):
+                res = self.ea_layer.load_state_dict(sd, strict=False)
+                loaded = len(target_keys) - len(res.missing_keys)
+                return res, loaded
+
+            # First try raw keys.
+            best_sd = state_dict
+            best_res, best_loaded = _load(best_sd)
+
+            # If too few keys are loaded, try common wrapper prefixes.
+            # This handles checkpoints saved from wrapped engines (e.g. deepspeed/module).
+            if best_loaded < max(8, int(0.2 * max(1, len(target_keys)))):
+                candidates = (
+                    "module.",
+                    "model.",
+                    "module.model.",
+                    "ea_layer.",
+                    "module.ea_layer.",
+                    "model.ea_layer.",
+                )
+                for prefix in candidates:
+                    remapped = {}
+                    hit = 0
+                    for k, v in state_dict.items():
+                        nk = k[len(prefix):] if k.startswith(prefix) else k
+                        remapped[nk] = v
+                        if nk in target_keys:
+                            hit += 1
+                    if hit == 0:
+                        continue
+                    res, loaded = _load(remapped)
+                    if loaded > best_loaded:
+                        best_sd = remapped
+                        best_res = res
+                        best_loaded = loaded
+            return best_res, best_loaded, len(target_keys)
+
+        load_, loaded_keys, total_keys = _try_load_with_optional_prefix_strip(ea_layer_state_dict)
+
+        raw_missing_keys = list(load_.missing_keys)
+        raw_unexpected_keys = list(load_.unexpected_keys)
+        missing_n = len(raw_missing_keys)
+        unexpected_n = len(raw_unexpected_keys)
+        loaded_ratio = float(loaded_keys / max(1, total_keys))
+
+        # Some checkpoint/key mismatches are expected across training/inference variants:
+        # - embed_tokens.weight can be omitted when frozen params are excluded from save.
+        # - t2d_index is a train-side helper buffer introduced in newer checkpoints.
+        benign_missing = {"embed_tokens.weight"}
+        benign_unexpected = {"t2d_index"}
+        effective_missing_keys = [k for k in raw_missing_keys if k not in benign_missing]
+        effective_unexpected_keys = [k for k in raw_unexpected_keys if k not in benign_unexpected]
+        effective_loaded = total_keys - len(effective_missing_keys)
+        effective_loaded_ratio = float(effective_loaded / max(1, total_keys))
+        if missing_n > 0 or unexpected_n > 0:
+            print(
+                "[ea-load] "
+                f"loaded={loaded_keys}/{total_keys} ({loaded_ratio:.1%}), "
+                f"missing={missing_n}, unexpected={unexpected_n}"
+            )
+            if missing_n > 0:
+                print(f"[ea-load] missing(sample)={raw_missing_keys[:12]}")
+            if unexpected_n > 0:
+                print(f"[ea-load] unexpected(sample)={raw_unexpected_keys[:12]}")
+            if effective_missing_keys or effective_unexpected_keys:
+                print(
+                    "[ea-load] "
+                    f"effective_missing={len(effective_missing_keys)}, "
+                    f"effective_unexpected={len(effective_unexpected_keys)}, "
+                    f"effective_loaded={effective_loaded}/{total_keys} ({effective_loaded_ratio:.1%})"
+                )
+        else:
+            print(f"[ea-load] loaded={loaded_keys}/{total_keys} (100.0%)")
+
+        critical_candidates = (
+            "fc.weight",
+            "lm_head.weight",
+            "midlayer.self_attn.q_proj.weight",
+            "midlayer.self_attn.k_proj.weight",
+            "midlayer.self_attn.v_proj.weight",
+            "midlayer.mlp.down_proj.weight",
+        )
+        missing_set = set(effective_missing_keys)
+        critical_missing = [k for k in critical_candidates if k in missing_set]
+        if critical_missing:
+            msg = f"critical ea_layer weights missing after load: {critical_missing}"
+            if os.environ.get("EAGLE_STRICT_HEAD_LOAD", "0") == "1":
+                raise RuntimeError(msg)
+            print(f"[ea-load][warn] {msg}")
+
+        # Optional debug stats for critical tensors to detect silent corruption
+        # (e.g., all-zero/NaN weights that can cause repetitive token collapse).
+        if os.environ.get("EAGLE_DEBUG_HEAD_STATS", "1") == "1":
+            sd = self.ea_layer.state_dict()
+            for name in critical_candidates:
+                if name not in sd:
+                    continue
+                w = sd[name].detach()
+                finite = torch.isfinite(w)
+                finite_ratio = float(finite.float().mean().item())
+                if finite.any():
+                    wf = w[finite].float()
+                    mean = float(wf.mean().item())
+                    std = float(wf.std(unbiased=False).item())
+                    absmax = float(wf.abs().max().item())
+                else:
+                    mean = float("nan")
+                    std = float("nan")
+                    absmax = float("nan")
+                print(
+                    "[ea-load] tensor "
+                    f"name={name} shape={tuple(w.shape)} finite_ratio={finite_ratio:.6f} "
+                    f"mean={mean:.6e} std={std:.6e} absmax={absmax:.6e}"
+                )
+
+        # Optional strict guard for production debugging.
+        if (
+            os.environ.get("EAGLE_STRICT_HEAD_LOAD", "0") == "1"
+            and (
+                effective_loaded_ratio < 0.95
+                or len(effective_missing_keys) > 0
+                or len(effective_unexpected_keys) > 0
+            )
+        ):
+            raise RuntimeError(
+                "EAGLE_STRICT_HEAD_LOAD=1 and ea_layer checkpoint load is incomplete: "
+                f"effective_loaded={effective_loaded}/{total_keys}, "
+                f"effective_missing={len(effective_missing_keys)}, "
+                f"effective_unexpected={len(effective_unexpected_keys)}, "
+                f"raw_missing={missing_n}, raw_unexpected={unexpected_n}"
+            )
+
+        # Quick health checks for draft vocab mapping. If these look degenerate,
+        # generation often collapses to repeated punctuation/special tokens.
+        strict_draft_map = os.environ.get("EAGLE_STRICT_DRAFT_MAP", "1") == "1"
+        if self.config.vocab_size != self.ea_layer.config.draft_vocab_size:
+            issues = []
+            selected = None
+            d2t_nonzero = None
+            map_min = None
+            map_max = None
+            map_unique = None
+            if not hasattr(self.ea_layer, "t2d"):
+                issues.append("missing buffer t2d")
+            if not hasattr(self.ea_layer, "d2t"):
+                issues.append("missing buffer d2t")
+            if hasattr(self.ea_layer, "t2d"):
+                try:
+                    selected = int(self.ea_layer.t2d.sum().item())
+                    if selected <= 0:
+                        issues.append("t2d has zero selected tokens")
+                    elif selected < max(8, int(0.1 * int(self.ea_layer.config.draft_vocab_size))):
+                        issues.append(
+                            f"t2d selected tokens too small: {selected} "
+                            f"(draft_vocab_size={int(self.ea_layer.config.draft_vocab_size)})"
+                        )
+                except Exception as e:
+                    issues.append(f"t2d check failed: {e}")
+            if hasattr(self.ea_layer, "d2t"):
+                try:
+                    d2t_nonzero = int((self.ea_layer.d2t != 0).sum().item())
+                    if d2t_nonzero <= 0:
+                        issues.append("d2t appears all-zero")
+                    d2t = self.ea_layer.d2t.long()
+                    idx = torch.arange(d2t.numel(), device=d2t.device, dtype=torch.long)
+                    mapped = idx + d2t
+                    map_min = int(mapped.min().item())
+                    map_max = int(mapped.max().item())
+                    map_unique = int(torch.unique(mapped).numel())
+                    if map_min < 0 or map_max >= int(self.config.vocab_size):
+                        issues.append(
+                            f"d2t mapped ids out of range: min={map_min}, max={map_max}, "
+                            f"vocab={int(self.config.vocab_size)}"
+                        )
+                    if map_unique != int(self.ea_layer.config.draft_vocab_size):
+                        issues.append(
+                            f"d2t mapped ids not unique: unique={map_unique}, "
+                            f"draft_vocab={int(self.ea_layer.config.draft_vocab_size)}"
+                        )
+                    if hasattr(self.ea_layer, "t2d"):
+                        in_mask = self.ea_layer.t2d[mapped].all().item()
+                        if not bool(in_mask):
+                            issues.append("d2t mapped ids are not all marked by t2d")
+                except Exception as e:
+                    issues.append(f"d2t check failed: {e}")
+
+            print(
+                "[ea-load] draft-map "
+                f"strict={int(strict_draft_map)} selected_t2d={selected} d2t_nonzero={d2t_nonzero} "
+                f"map_min={map_min} map_max={map_max} map_unique={map_unique} "
+                f"draft_vocab={int(self.ea_layer.config.draft_vocab_size)} vocab={int(self.config.vocab_size)}"
+            )
+
+            if issues:
+                msg = (
+                    "invalid/degenerate draft vocab mapping after checkpoint load: "
+                    + "; ".join(issues)
+                    + ". This usually means ea head checkpoint did not load mapping buffers "
+                      "(e.g. key prefix mismatch or missing buffers in saved state)."
+                )
+                if strict_draft_map:
+                    raise RuntimeError(msg)
+                print(f"[ea-load][warn] {msg}")
         self.ea_layer.to(self.base_model.dtype).to(device)
         self.ea_layer.init_tree()
 
@@ -197,6 +402,8 @@ class EaModel(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
+                output_hidden_states=bool(self.use_eagle3),
+                return_dict=True,
             )
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])
