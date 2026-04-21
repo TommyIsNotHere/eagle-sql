@@ -37,6 +37,7 @@ import multiprocessing
 import re
 import time
 import hashlib
+import json
 import importlib
 import importlib.util
 from pathlib import Path
@@ -466,7 +467,7 @@ class LlamaDecoderLayeremb(nn.Module):
             self,
             input_emb: torch.Tensor,
             hidden_states: torch.Tensor,
-            cache_hidden: [List[torch.Tensor]] = [],
+            cache_hidden: Optional[List[torch.Tensor]] = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
             past_key_value: Optional[Tuple[torch.Tensor]] = None,
@@ -491,6 +492,8 @@ class LlamaDecoderLayeremb(nn.Module):
 
         hidden_states = self.hidden_norm(hidden_states)
         input_emb = self.input_layernorm(input_emb)
+        if cache_hidden is None:
+            cache_hidden = [[], []]
 
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
 
@@ -615,9 +618,48 @@ class Model(nn.Module):
         self._teacher_mask_fallback_steps = int(
             os.environ.get("EAGLE_TEACHER_MASK_FALLBACK_STEPS", "1000000")
         )
-        # For Qwen teacher forward during distillation, prefer HF implementation by default.
-        # The custom KV variant can be enabled with EAGLE_QWEN_TEACHER_IMPL=kv for debugging.
-        self.qwen_teacher_impl = os.environ.get("EAGLE_QWEN_TEACHER_IMPL", "hf").strip().lower()
+        # Keep teacher forward path aligned with inference runtime by default.
+        self.qwen_teacher_impl = os.environ.get("EAGLE_QWEN_TEACHER_IMPL", "kv").strip().lower()
+        self.strict_teacher_impl = os.environ.get("EAGLE_STRICT_TEACHER_IMPL", "1") == "1"
+        self.teacher_hidden_selector = os.environ.get("EAGLE_TEACHER_HIDDEN_SELECTOR", "paper").strip().lower()
+        self.teacher_hidden_custom = os.environ.get("EAGLE_TEACHER_HIDDEN_CUSTOM", "").strip()
+        if self.teacher_hidden_selector not in {"legacy", "paper", "custom"}:
+            print(
+                "WARN: invalid EAGLE_TEACHER_HIDDEN_SELECTOR="
+                f"{self.teacher_hidden_selector}, fallback to legacy"
+            )
+            self.teacher_hidden_selector = "legacy"
+        # Paper-aligned default for training-time test: feed self predictions
+        # back during training rollout.
+        self.input_rollout_mode = os.environ.get("EAGLE_INPUT_ROLLOUT_MODE", "pred").strip().lower()
+        if self.input_rollout_mode not in {"teacher", "pred", "scheduled"}:
+            print(
+                "WARN: invalid EAGLE_INPUT_ROLLOUT_MODE="
+                f"{self.input_rollout_mode}, fallback to teacher"
+            )
+            self.input_rollout_mode = "teacher"
+        try:
+            _rollout_ratio_start = float(os.environ.get("EAGLE_INPUT_ROLLOUT_RATIO_START", "0.0"))
+        except Exception:
+            _rollout_ratio_start = 0.0
+        try:
+            _rollout_ratio_end = float(os.environ.get("EAGLE_INPUT_ROLLOUT_RATIO_END", "0.3"))
+        except Exception:
+            _rollout_ratio_end = 0.3
+        self.input_rollout_ratio_start = min(1.0, max(0.0, _rollout_ratio_start))
+        self.input_rollout_ratio_end = min(1.0, max(0.0, _rollout_ratio_end))
+        self.input_rollout_align_target = os.environ.get("EAGLE_INPUT_ROLLOUT_ALIGN_TARGET", "1") == "1"
+        self.loss_mode = os.environ.get("EAGLE_LOSS_MODE", "hybrid").strip().lower()
+        if self.loss_mode not in {"hybrid", "paper"}:
+            print(f"WARN: invalid EAGLE_LOSS_MODE={self.loss_mode}, fallback to hybrid")
+            self.loss_mode = "hybrid"
+        # Anchor distillation with supervised CE on gold draft-token ids.
+        try:
+            _gold_w = float(os.environ.get("EAGLE_GOLD_CE_WEIGHT", "0.35"))
+        except Exception:
+            _gold_w = 0.35
+        self.gold_ce_weight = min(1.0, max(0.0, _gold_w))
+        self.distill_only_in_draft = os.environ.get("EAGLE_DISTILL_ONLY_IN_DRAFT", "1") == "1"
         self._trace_nonfinite_steps = int(os.environ.get("EAGLE_TRACE_NONFINITE_STEPS", "8"))
         self._check_target_param_finite = os.environ.get("EAGLE_CHECK_TARGET_PARAM_FINITE", "0") == "1"
         self._nonfinite_found_this_step = 0
@@ -636,6 +678,18 @@ class Model(nn.Module):
             target_dtype = torch.bfloat16
         arch = (getattr(base_cfg, "architectures", None) or [""])[0]
         require_qwen_kv = os.environ.get("EAGLE_REQUIRE_QWEN_KV", "0") == "1"
+        print(
+            "[train-loss-config] "
+            f"gold_ce_weight={self.gold_ce_weight:.3f} "
+            f"distill_only_in_draft={int(self.distill_only_in_draft)} "
+            f"loss_mode={self.loss_mode} "
+            f"teacher_hidden_selector={self.teacher_hidden_selector} "
+            f"input_rollout_mode={self.input_rollout_mode} "
+            f"input_rollout_align_target={int(self.input_rollout_align_target)} "
+            f"input_rollout_ratio=({self.input_rollout_ratio_start:.2f}->{self.input_rollout_ratio_end:.2f}) "
+            f"strict_teacher_impl={int(self.strict_teacher_impl)} "
+            f"teacher_impl={self.qwen_teacher_impl}"
+        )
 
         def _load_with_dtype(model_cls, model_path, dtype):
             # transformers>=4.56 prefers `dtype`; older versions may only support `torch_dtype`.
@@ -645,6 +699,11 @@ class Model(nn.Module):
                 return model_cls.from_pretrained(model_path, torch_dtype=dtype)
 
         if arch == "Qwen2ForCausalLM":
+            if self.strict_teacher_impl and self.qwen_teacher_impl != "kv":
+                raise ValueError(
+                    "Qwen2 training requires EAGLE_QWEN_TEACHER_IMPL=kv when "
+                    "EAGLE_STRICT_TEACHER_IMPL=1 to keep teacher/runtime path aligned."
+                )
             if self.qwen_teacher_impl == "hf":
                 print("INFO: EAGLE_QWEN_TEACHER_IMPL=hf -> use transformers.AutoModelForCausalLM as teacher")
                 self.target_model = _load_with_dtype(AutoModelForCausalLM, path, target_dtype)
@@ -664,6 +723,7 @@ class Model(nn.Module):
                     print("WARN: fallback to transformers.AutoModelForCausalLM")
                     self.target_model = _load_with_dtype(AutoModelForCausalLM, path, target_dtype)
                 else:
+                    print("INFO: EAGLE_QWEN_TEACHER_IMPL=kv -> use custom KVQwen2ForCausalLM as teacher")
                     self.target_model = _load_with_dtype(KVQwen2ForCausalLM, path, target_dtype)
             else:
                 raise ValueError(
@@ -789,6 +849,112 @@ class Model(nn.Module):
             t2d_index[used_tokens] = torch.arange(used_tokens.numel(), dtype=torch.long)
         return t2d_index
 
+    def _normalize_teacher_hidden_indices(self, indices, total_hidden_states: int):
+        if total_hidden_states <= 0:
+            raise ValueError("teacher hidden states must be non-empty")
+
+        out = []
+        for idx in indices:
+            try:
+                i = int(idx)
+            except Exception:
+                continue
+            i = min(max(i, 0), total_hidden_states - 1)
+            out.append(i)
+
+        if not out:
+            out = [0]
+        if len(out) >= 3:
+            return out[:3]
+        while len(out) < 3:
+            out.append(out[-1])
+        return out
+
+    def _resolve_teacher_hidden_indices(self, total_hidden_states: int):
+        if self.teacher_hidden_selector == "legacy":
+            return self._normalize_teacher_hidden_indices([0, 1, 2], total_hidden_states)
+
+        if self.teacher_hidden_selector == "custom":
+            raw = self.teacher_hidden_custom
+            if raw:
+                custom = [x.strip() for x in raw.split(",") if x.strip()]
+                return self._normalize_teacher_hidden_indices(custom, total_hidden_states)
+            print("WARN: EAGLE_TEACHER_HIDDEN_SELECTOR=custom but EAGLE_TEACHER_HIDDEN_CUSTOM is empty")
+            return self._normalize_teacher_hidden_indices([0, 1, 2], total_hidden_states)
+
+        # paper: low/mid/high from decoder stack (skip embedding at 0 when possible)
+        last = total_hidden_states - 1
+        low = 1 if total_hidden_states > 1 else 0
+        mid = (low + last) // 2
+        return self._normalize_teacher_hidden_indices([low, mid, last], total_hidden_states)
+
+    def _scheduled_rollout_ratio(self, step_idx: int):
+        if self.length <= 1:
+            return self.input_rollout_ratio_end
+        alpha = float(step_idx) / float(max(1, self.length - 1))
+        ratio = self.input_rollout_ratio_start + alpha * (
+            self.input_rollout_ratio_end - self.input_rollout_ratio_start
+        )
+        return min(1.0, max(0.0, ratio))
+
+    def _rollout_next_input_ids(self, input_ids, pred_draft_ids, next_loss_mask, step_idx: int):
+        teacher_next = padding(input_ids, left=False)
+        if self.input_rollout_mode == "teacher":
+            return teacher_next
+
+        if not hasattr(self, "draft_to_token"):
+            return teacher_next
+        if self.draft_to_token.numel() <= 0:
+            return teacher_next
+
+        draft_to_token = self.draft_to_token.to(input_ids.device)
+        pred_draft_ids = pred_draft_ids.long().clamp(min=0, max=draft_to_token.numel() - 1)
+        pred_token_ids = draft_to_token[pred_draft_ids]
+
+        replace_mask = next_loss_mask.squeeze(-1) > 0.5
+        if self.input_rollout_mode == "pred":
+            return torch.where(replace_mask, pred_token_ids, teacher_next)
+
+        ratio = self._scheduled_rollout_ratio(step_idx)
+        if ratio <= 0.0:
+            return teacher_next
+        if ratio >= 1.0:
+            return torch.where(replace_mask, pred_token_ids, teacher_next)
+        sample_mask = torch.rand_like(teacher_next.float()) < ratio
+        mix_mask = replace_mask & sample_mask
+        return torch.where(mix_mask, pred_token_ids, teacher_next)
+
+    @torch.no_grad()
+    def _compute_teacher_distill_target(self, input_ids, attention_mask):
+        teacher_attention_mask = (
+            attention_mask if (self.use_padding_attn_mask or self.force_teacher_attn_mask) else None
+        )
+
+        def _run_teacher_logits(mask):
+            outs_local = self.target_model(
+                input_ids=input_ids,
+                attention_mask=mask,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            return outs_local.logits
+
+        target = _run_teacher_logits(teacher_attention_mask)
+        if (
+            teacher_attention_mask is None
+            and attention_mask is not None
+            and self._teacher_mask_fallback_steps > 0
+        ):
+            primary_bad = int((~torch.isfinite(target)).sum().item())
+            if primary_bad > 0:
+                target_masked = _run_teacher_logits(attention_mask)
+                masked_bad = int((~torch.isfinite(target_masked)).sum().item())
+                if masked_bad <= primary_bad:
+                    target = target_masked
+                self._teacher_mask_fallback_steps -= 1
+
+        return padding(target, left=False)
+
     def _trace_nonfinite(self, stage: str, tensor: torch.Tensor):
         bad_mask = ~torch.isfinite(tensor)
         bad_count = int(bad_mask.sum().item())
@@ -853,13 +1019,28 @@ class Model(nn.Module):
             )
         return ratio
 
-    def scandata(self, datapath, tokenizerpath, tokenized_dataset=None):
+    def scandata(self, datapath, tokenizerpath, tokenized_dataset=None, cache_context=None):
         N = self.draft_vocab_size
         tokenizer_tag = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(tokenizerpath).strip("/"))
-        # Bind cache key to datapath as well; otherwise caches from a previous
-        # dataset can be silently reused and make draft-vocab coverage collapse.
-        datapath_key = hashlib.md5(str(datapath).encode("utf-8")).hexdigest()[:12]
-        cache_path = f"cache_{tokenizer_tag}_{datapath_key}_{N}.pt"
+        datapath_sig = str(datapath)
+        try:
+            datapath_path = Path(datapath).resolve()
+            if datapath_path.exists():
+                st = datapath_path.stat()
+                datapath_sig = f"{datapath_path}|{int(st.st_size)}|{int(st.st_mtime_ns)}"
+            else:
+                datapath_sig = str(datapath_path)
+        except Exception:
+            datapath_sig = str(datapath)
+        datapath_key = hashlib.md5(datapath_sig.encode("utf-8")).hexdigest()[:12]
+        cache_context_payload = "none"
+        if cache_context is not None:
+            try:
+                cache_context_payload = json.dumps(cache_context, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+            except Exception:
+                cache_context_payload = repr(cache_context)
+        cache_context_key = hashlib.md5(cache_context_payload.encode("utf-8")).hexdigest()[:8]
+        cache_path = f"cache_{tokenizer_tag}_{datapath_key}_{cache_context_key}_{N}.pt"
         lock_path = f"{cache_path}.lock"
         rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
         lock_stale_sec = int(os.environ.get("EAGLE_SCANDATA_LOCK_STALE_SEC", "10800"))
@@ -909,10 +1090,12 @@ class Model(nn.Module):
                         print(f"[scandata][rank {rank}] WARN: failed to save cache: {e}")
 
             t2d_index = self._build_t2d_index(t2d)
+            draft_to_token = torch.arange(d2t.numel(), dtype=torch.long) + d2t.long()
             self._estimate_in_draft_ratio(tokenized_dataset, t2d, rank)
             self.register_buffer("d2t", d2t)
             self.register_buffer("t2d", t2d)
             self.register_buffer("t2d_index", t2d_index)
+            self.register_buffer("draft_to_token", draft_to_token)
             self.l1smooth = nn.SmoothL1Loss(reduction="none")
             return
 
@@ -1059,9 +1242,11 @@ class Model(nn.Module):
             d2t = cache["d2t"]
             t2d = cache["t2d"]
         t2d_index = self._build_t2d_index(t2d)
+        draft_to_token = torch.arange(d2t.numel(), dtype=torch.long) + d2t.long()
         self.register_buffer("d2t", d2t)
         self.register_buffer("t2d", t2d)
         self.register_buffer("t2d_index", t2d_index)
+        self.register_buffer("draft_to_token", draft_to_token)
         self.l1smooth = nn.SmoothL1Loss(reduction="none")
 
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
@@ -1101,13 +1286,12 @@ class Model(nn.Module):
                 output_hidden_states=True,
                 return_dict=True,
             )
-            hs0 = outs_local.hidden_states[0]
-            hs1 = outs_local.hidden_states[1]
-            hs2 = outs_local.hidden_states[2]
-            self._trace_nonfinite("teacher/hidden0_raw", hs0)
-            self._trace_nonfinite("teacher/hidden1_raw", hs1)
-            self._trace_nonfinite("teacher/hidden2_raw", hs2)
-            hs = torch.cat((hs0, hs1, hs2), dim=-1)
+            hidden_states_all = outs_local.hidden_states
+            hidden_idx = self._resolve_teacher_hidden_indices(len(hidden_states_all))
+            hs_chunks = [hidden_states_all[i] for i in hidden_idx]
+            for i, hs_i in zip(hidden_idx, hs_chunks):
+                self._trace_nonfinite(f"teacher/hidden_raw_l{i}", hs_i)
+            hs = torch.cat(hs_chunks, dim=-1)
             tg = outs_local.logits
             return hs, tg
 
@@ -1183,6 +1367,7 @@ class Model(nn.Module):
         self._nonfinite_found_this_step = 0
         self._nonfinite_stage_this_step = ""
         hidden_states, target, loss_mask, input_ids = self.dataprepare(input_ids, attention_mask, loss_mask)
+        rollout_attention_mask = padding(attention_mask, left=False) if attention_mask is not None else None
 
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
@@ -1281,11 +1466,16 @@ class Model(nn.Module):
                 label_in_draft = t2d_mask[label_token_ids]
                 label_draft_ids = t2d_index[label_token_ids]
 
-                # Distill teacher distribution on draft vocab for all supervised tokens.
-                # Accuracy is still computed only when gold labels fall inside draft vocab.
+                # Distill teacher distribution on draft vocab and anchor with
+                # supervised CE on gold draft-token ids.
                 supervised_mask = loss_mask.float()
                 in_draft_position_mask = label_in_draft[..., None].float() * supervised_mask
                 position_mask = supervised_mask
+                if self.distill_only_in_draft:
+                    # Use in-draft positions for distillation when possible. Fallback
+                    # to all supervised positions to avoid fully-zero gradient batches.
+                    if float(in_draft_position_mask.sum().item()) > 0.0:
+                        position_mask = in_draft_position_mask
                 target_head = target[..., t2d_mask].float()
                 self._trace_nonfinite(f"teacher/layer{idx}_target_head_raw", target_head)
                 target_row_is_finite = torch.isfinite(target_head).all(dim=2, keepdim=True)
@@ -1310,12 +1500,39 @@ class Model(nn.Module):
             logits_row_is_finite = torch.isfinite(raw_logits).all(dim=2)
             logits = torch.nan_to_num(raw_logits, nan=0.0, posinf=30.0, neginf=-30.0)
             out_logp = F.log_softmax(logits, dim=2)
-            per_token_loss = -(target_p * out_logp).sum(dim=2)
-            per_token_loss = torch.nan_to_num(per_token_loss, nan=0.0, posinf=0.0, neginf=0.0)
+            distill_per_token_loss = -(target_p * out_logp).sum(dim=2)
+            distill_per_token_loss = torch.nan_to_num(distill_per_token_loss, nan=0.0, posinf=0.0, neginf=0.0)
             token_mask = position_mask.squeeze(-1).float()
             raw_valid_tokens = token_mask.sum()
             valid_tokens = raw_valid_tokens.clamp_min(1.0)
-            loss = (per_token_loss * token_mask).sum() / valid_tokens
+            distill_loss = (distill_per_token_loss * token_mask).sum() / valid_tokens
+
+            # Gold anchor loss: only on supervised tokens whose gold ids are inside draft vocab.
+            ignore_index = -100
+            supervised_2d = supervised_mask.squeeze(-1) > 0.5
+            gold_target = label_draft_ids.clone()
+            invalid_gold = (~label_in_draft) | (~supervised_2d) | (label_draft_ids < 0)
+            gold_target = gold_target.masked_fill(invalid_gold, ignore_index)
+            gold_valid_mask = (gold_target != ignore_index).float()
+            gold_valid_tokens = gold_valid_mask.sum()
+            if self.loss_mode == "paper":
+                gold_loss = distill_loss.new_zeros(())
+                loss = distill_loss
+            elif float(gold_valid_tokens.item()) > 0.0 and self.gold_ce_weight > 0.0:
+                flat_logp = out_logp.reshape(-1, out_logp.size(-1))
+                flat_target = gold_target.reshape(-1)
+                gold_nll = F.nll_loss(
+                    flat_logp,
+                    flat_target,
+                    reduction="none",
+                    ignore_index=ignore_index,
+                ).reshape_as(gold_target)
+                gold_nll = torch.nan_to_num(gold_nll.float(), nan=0.0, posinf=0.0, neginf=0.0)
+                gold_loss = (gold_nll * gold_valid_mask).sum() / gold_valid_tokens.clamp_min(1.0)
+                loss = (1.0 - self.gold_ce_weight) * distill_loss + self.gold_ce_weight * gold_loss
+            else:
+                gold_loss = distill_loss.new_zeros(())
+                loss = distill_loss
             plosses.append(loss)
             with torch.no_grad():
                 pred_ids = logits.argmax(-1)
@@ -1329,15 +1546,21 @@ class Model(nn.Module):
                     if rank == 0:
                         supervised_tokens = float(loss_mask.sum().item())
                         in_draft_tokens = float(in_draft_position_mask.sum().item())
+                        distill_tokens = float(raw_valid_tokens.item())
+                        gold_tokens = float(gold_valid_tokens.item())
                         finite_teacher_rows = float(target_row_is_finite.squeeze(-1).sum().item())
                         finite_student_rows = float(logits_row_is_finite.sum().item())
                         print(
                             "[numerics] "
                             f"supervised_tokens={supervised_tokens:.0f}, "
                             f"in_draft_tokens={in_draft_tokens:.0f}, "
+                            f"distill_tokens={distill_tokens:.0f}, "
+                            f"gold_tokens={gold_tokens:.0f}, "
                             f"finite_teacher_rows={finite_teacher_rows:.0f}, "
                             f"finite_student_rows={finite_student_rows:.0f}, "
                             f"valid_tokens={float(valid_tokens.item()):.0f}, "
+                            f"distill_loss={float(distill_loss.item()):.6f}, "
+                            f"gold_loss={float(gold_loss.item()):.6f}, "
                             f"batch_acc={acces[-1]:.6f}, batch_ploss={float(loss.item()):.6f}"
                         )
                         if supervised_tokens > 0 and float(raw_valid_tokens.item()) <= 0.0:
@@ -1348,9 +1571,26 @@ class Model(nn.Module):
                     self._debug_numerics_steps -= 1
 
             if not last:
-                input_ids = padding(input_ids, left=False)
-                target = padding(target, left=False)
-                loss_mask = padding(loss_mask, left=False)
+                next_loss_mask = padding(loss_mask, left=False)
+                next_input_ids = self._rollout_next_input_ids(
+                    input_ids=input_ids,
+                    pred_draft_ids=pred_ids,
+                    next_loss_mask=next_loss_mask,
+                    step_idx=idx,
+                )
+                next_rollout_attention_mask = (
+                    padding(rollout_attention_mask, left=False)
+                    if rollout_attention_mask is not None
+                    else None
+                )
+                if self.input_rollout_align_target and self.input_rollout_mode != "teacher":
+                    next_target = self._compute_teacher_distill_target(next_input_ids, next_rollout_attention_mask)
+                else:
+                    next_target = padding(target, left=False)
+                input_ids = next_input_ids
+                target = next_target
+                loss_mask = next_loss_mask
+                rollout_attention_mask = next_rollout_attention_mask
 
 
 

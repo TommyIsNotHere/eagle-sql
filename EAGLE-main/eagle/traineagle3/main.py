@@ -1,6 +1,7 @@
 import argparse
 import deepspeed
 import math
+import os
 import time
 import inspect
 import subprocess
@@ -34,6 +35,12 @@ parser.add_argument('--global-stall-seconds', type=float, default=1200.0)
 parser.add_argument('--abort-on-global-stall', type=int, default=1)
 parser.add_argument('--stall-diagnostics', type=int, default=1)
 parser.add_argument('--stall-diagnostics-cooldown', type=float, default=300.0)
+parser.add_argument(
+    '--system-prompt',
+    type=str,
+    default=os.environ.get("EAGLE_TRAIN_SYSTEM_PROMPT", "auto"),
+    help="System prompt mode for tokenization: auto|bird|sql|generic or a literal custom prompt",
+)
 parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
@@ -74,7 +81,6 @@ train_config = {
 
 from safetensors import safe_open
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 import torch
 from cnets import padding
@@ -95,12 +101,12 @@ from tqdm import tqdm
 # import accelerate
 import numpy as np
 from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmup
-from data_utils import build_tokenized_sample
+from data_utils import build_tokenized_sample, resolve_system_prompt
 
 
 
 def build_dataset_rank(
-        tokenizer, datapath
+        tokenizer, datapath, system_prompt
 ):
 
     ds = load_dataset('json', data_files=datapath)
@@ -122,6 +128,7 @@ def build_dataset_rank(
                 tokenizer=tokenizer,
                 source=source,
                 max_len=train_config["max_len"],
+                system_prompt=system_prompt,
             )
             if sample is None:
                 continue
@@ -182,8 +189,15 @@ class DataCollatorWithPadding:
 
 
 tokenizer = AutoTokenizer.from_pretrained(args.basepath)
-traindataset = build_dataset_rank(tokenizer, args.trainpath)
-testdataset = build_dataset_rank(tokenizer, args.testpath)
+train_system_prompt = resolve_system_prompt(args.system_prompt)
+print(
+    "[prompt] "
+    f"mode={args.system_prompt} "
+    f"chars={len(train_system_prompt)} "
+    f"preview={train_system_prompt[:120].replace(chr(10), ' ')}"
+)
+traindataset = build_dataset_rank(tokenizer, args.trainpath, train_system_prompt)
+testdataset = build_dataset_rank(tokenizer, args.testpath, train_system_prompt)
 
 world_size_env = max(1, int(os.environ.get("WORLD_SIZE", "1")))
 global_batch = (
@@ -246,7 +260,18 @@ print(f"[stage] Model() done in {time.time() - _stage_t0:.1f}s")
 
 _stage_t0 = time.time()
 print("[stage] model.scandata() ...")
-model.scandata(args.trainpath, args.basepath, tokenized_dataset=traindataset)
+model.scandata(
+    args.trainpath,
+    args.basepath,
+    tokenized_dataset=traindataset,
+    cache_context={
+        "max_len": int(train_config["max_len"]),
+        "system_prompt_mode": str(args.system_prompt),
+        "system_prompt_text": train_system_prompt,
+        "draft_vocab_size": int(config.draft_vocab_size),
+        "teacher_hidden_selector": os.environ.get("EAGLE_TEACHER_HIDDEN_SELECTOR", "paper"),
+    },
+)
 print(f"[stage] model.scandata() done in {time.time() - _stage_t0:.1f}s")
 
 

@@ -34,7 +34,20 @@ EAGLE_DEBUG_NUMERICS_STEPS="${EAGLE_DEBUG_NUMERICS_STEPS:-3}"
 EAGLE_FORCE_TEACHER_ATTN_MASK="${EAGLE_FORCE_TEACHER_ATTN_MASK:-1}"
 EAGLE_DEBUG_TEACHER_NUMERICS_STEPS="${EAGLE_DEBUG_TEACHER_NUMERICS_STEPS:-3}"
 EAGLE_TEACHER_MASK_FALLBACK_STEPS="${EAGLE_TEACHER_MASK_FALLBACK_STEPS:-1000000}"
-EAGLE_QWEN_TEACHER_IMPL="${EAGLE_QWEN_TEACHER_IMPL:-hf}"
+# Keep teacher forward path aligned with inference runtime by default.
+EAGLE_QWEN_TEACHER_IMPL="${EAGLE_QWEN_TEACHER_IMPL:-kv}"
+EAGLE_STRICT_TEACHER_IMPL="${EAGLE_STRICT_TEACHER_IMPL:-1}"
+EAGLE_TEACHER_HIDDEN_SELECTOR="${EAGLE_TEACHER_HIDDEN_SELECTOR:-paper}" # legacy/paper/custom
+EAGLE_TEACHER_HIDDEN_CUSTOM="${EAGLE_TEACHER_HIDDEN_CUSTOM:-}"            # custom mode only, e.g. "1,24,48"
+EAGLE_TRAIN_SYSTEM_PROMPT="${EAGLE_TRAIN_SYSTEM_PROMPT:-bird}" # auto/bird/sql/generic or custom prompt text
+EAGLE_GOLD_CE_WEIGHT="${EAGLE_GOLD_CE_WEIGHT:-0.35}"
+EAGLE_DISTILL_ONLY_IN_DRAFT="${EAGLE_DISTILL_ONLY_IN_DRAFT:-1}"
+EAGLE_LOSS_MODE="${EAGLE_LOSS_MODE:-hybrid}" # hybrid/paper
+# Paper-aligned default: enable training-time test via self rollout.
+EAGLE_INPUT_ROLLOUT_MODE="${EAGLE_INPUT_ROLLOUT_MODE:-pred}" # teacher/pred/scheduled
+EAGLE_INPUT_ROLLOUT_RATIO_START="${EAGLE_INPUT_ROLLOUT_RATIO_START:-0.0}"
+EAGLE_INPUT_ROLLOUT_RATIO_END="${EAGLE_INPUT_ROLLOUT_RATIO_END:-0.3}"
+EAGLE_INPUT_ROLLOUT_ALIGN_TARGET="${EAGLE_INPUT_ROLLOUT_ALIGN_TARGET:-1}"
 EAGLE_TRACE_NONFINITE_STEPS="${EAGLE_TRACE_NONFINITE_STEPS:-8}"
 EAGLE_CHECK_TARGET_PARAM_FINITE="${EAGLE_CHECK_TARGET_PARAM_FINITE:-0}"
 EAGLE_FAIL_FAST_ON_MODEL_NONFINITE="${EAGLE_FAIL_FAST_ON_MODEL_NONFINITE:-1}"
@@ -173,6 +186,8 @@ log "runtime stall_guard global_stall_seconds=${GLOBAL_STALL_SECONDS} abort_on_g
 log "deepspeed zero overlap_comm=${DS_OVERLAP_COMM} contiguous_gradients=${DS_CONTIGUOUS_GRADIENTS} reduce_bucket=${DS_REDUCE_BUCKET_SIZE:-<keep-default>} allgather_bucket=${DS_ALLGATHER_BUCKET_SIZE:-<keep-default>}"
 log "distributed nccl_debug=${NCCL_DEBUG} nccl_debug_subsys=${NCCL_DEBUG_SUBSYS} nccl_trace_coll=${NCCL_TRACE_COLL} torch_dist_debug=${TORCH_DISTRIBUTED_DEBUG} blocking_wait=${NCCL_BLOCKING_WAIT}"
 log "safety fail_fast_nonfinite=${EAGLE_FAIL_FAST_ON_MODEL_NONFINITE} disable_autoresume=${EAGLE_DISABLE_AUTORESUME} require_qwen_kv=${REQUIRE_QWEN_KV} use_padding_attn_mask=${EAGLE_USE_PADDING_ATTN_MASK}"
+log "alignment teacher_impl=${EAGLE_QWEN_TEACHER_IMPL} strict_teacher_impl=${EAGLE_STRICT_TEACHER_IMPL} teacher_hidden_selector=${EAGLE_TEACHER_HIDDEN_SELECTOR} teacher_hidden_custom=${EAGLE_TEACHER_HIDDEN_CUSTOM:-<none>} train_system_prompt=${EAGLE_TRAIN_SYSTEM_PROMPT}"
+log "alignment loss_mode=${EAGLE_LOSS_MODE} gold_ce_weight=${EAGLE_GOLD_CE_WEIGHT} distill_only_in_draft=${EAGLE_DISTILL_ONLY_IN_DRAFT} rollout_mode=${EAGLE_INPUT_ROLLOUT_MODE} rollout_ratio=(${EAGLE_INPUT_ROLLOUT_RATIO_START}->${EAGLE_INPUT_ROLLOUT_RATIO_END}) rollout_align_target=${EAGLE_INPUT_ROLLOUT_ALIGN_TARGET}"
 
 [[ -d "${EAGLE_DIR}" ]] || die "EAGLE_DIR not found: ${EAGLE_DIR}"
 [[ -d "${BASE_MODEL_PATH}" ]] || die "BASE_MODEL_PATH not found: ${BASE_MODEL_PATH}"
@@ -330,6 +345,58 @@ EVAL_CHAT_LINES="$(wc -l < "${EVAL_CHAT_JSONL}" | tr -d ' ')"
 [[ "${TRAIN_CHAT_LINES}" -gt 0 ]] || die "train chat jsonl is empty: ${TRAIN_CHAT_JSONL}"
 log "train chat rows=${TRAIN_CHAT_LINES}, eval chat rows=${EVAL_CHAT_LINES}"
 
+log "step2.5: sanity-check SFT labels (SQL start/fence/backtick stats)"
+TRAIN_CHAT_JSONL="${TRAIN_CHAT_JSONL}" \
+python - <<'PY' 2>&1 | tee -a "${LOG_FILE}" || die "SFT sanity check failed"
+import json
+import os
+import re
+from collections import Counter
+from pathlib import Path
+
+path = Path(os.environ["TRAIN_CHAT_JSONL"])
+rows = 0
+bad_start = 0
+triple_fence = 0
+backtick_rows = 0
+first_counter = Counter()
+start_re = re.compile(r"(?is)^\s*(select|with|insert|update|delete)\b")
+
+with path.open("r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        conv = rec.get("conversations") or []
+        if len(conv) < 2:
+            continue
+        sql = str(conv[1].get("value", "")).strip()
+        rows += 1
+        if "```" in sql:
+            triple_fence += 1
+        if "`" in sql:
+            backtick_rows += 1
+        m = start_re.search(sql)
+        if not m:
+            bad_start += 1
+        else:
+            first_counter[m.group(1).upper()] += 1
+
+print(
+    "[sft-sanity] "
+    f"rows={rows} bad_start={bad_start} triple_fence={triple_fence} "
+    f"backtick_rows={backtick_rows} first_tokens={dict(first_counter)}"
+)
+
+if rows <= 0:
+    raise SystemExit("no usable rows found")
+if bad_start > 0:
+    raise SystemExit(f"non-SQL leading labels detected: {bad_start}/{rows}")
+if triple_fence > 0:
+    raise SystemExit(f"triple-backtick labels detected: {triple_fence}/{rows}")
+PY
+
 log "step3: train EAGLE3 head (DeepSpeed)"
 (
   cd eagle/traineagle3
@@ -340,6 +407,16 @@ log "step3: train EAGLE3 head (DeepSpeed)"
   EAGLE_DEBUG_TEACHER_NUMERICS_STEPS="${EAGLE_DEBUG_TEACHER_NUMERICS_STEPS}" \
   EAGLE_TEACHER_MASK_FALLBACK_STEPS="${EAGLE_TEACHER_MASK_FALLBACK_STEPS}" \
   EAGLE_QWEN_TEACHER_IMPL="${EAGLE_QWEN_TEACHER_IMPL}" \
+  EAGLE_STRICT_TEACHER_IMPL="${EAGLE_STRICT_TEACHER_IMPL}" \
+  EAGLE_TEACHER_HIDDEN_SELECTOR="${EAGLE_TEACHER_HIDDEN_SELECTOR}" \
+  EAGLE_TEACHER_HIDDEN_CUSTOM="${EAGLE_TEACHER_HIDDEN_CUSTOM}" \
+  EAGLE_GOLD_CE_WEIGHT="${EAGLE_GOLD_CE_WEIGHT}" \
+  EAGLE_DISTILL_ONLY_IN_DRAFT="${EAGLE_DISTILL_ONLY_IN_DRAFT}" \
+  EAGLE_LOSS_MODE="${EAGLE_LOSS_MODE}" \
+  EAGLE_INPUT_ROLLOUT_MODE="${EAGLE_INPUT_ROLLOUT_MODE}" \
+  EAGLE_INPUT_ROLLOUT_RATIO_START="${EAGLE_INPUT_ROLLOUT_RATIO_START}" \
+  EAGLE_INPUT_ROLLOUT_RATIO_END="${EAGLE_INPUT_ROLLOUT_RATIO_END}" \
+  EAGLE_INPUT_ROLLOUT_ALIGN_TARGET="${EAGLE_INPUT_ROLLOUT_ALIGN_TARGET}" \
   EAGLE_TRACE_NONFINITE_STEPS="${EAGLE_TRACE_NONFINITE_STEPS}" \
   EAGLE_CHECK_TARGET_PARAM_FINITE="${EAGLE_CHECK_TARGET_PARAM_FINITE}" \
   EAGLE_FAIL_FAST_ON_MODEL_NONFINITE="${EAGLE_FAIL_FAST_ON_MODEL_NONFINITE}" \
@@ -371,6 +448,7 @@ log "step3: train EAGLE3 head (DeepSpeed)"
     --abort-on-global-stall "${ABORT_ON_GLOBAL_STALL}" \
     --stall-diagnostics "${STALL_DIAGNOSTICS}" \
     --stall-diagnostics-cooldown "${STALL_DIAGNOSTICS_COOLDOWN}" \
+    --system-prompt "${EAGLE_TRAIN_SYSTEM_PROMPT}" \
     --deepspeed_config "${DS_CONFIG_EFFECTIVE}"
 ) 2>&1 | tee -a "${LOG_FILE}"
 

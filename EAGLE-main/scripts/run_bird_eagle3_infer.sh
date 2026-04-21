@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EAGLE_DIR="${EAGLE_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+
+if [[ ! -d "${EAGLE_DIR}/eagle" ]]; then
+  echo "ERROR: invalid EAGLE_DIR (missing eagle package): ${EAGLE_DIR}" >&2
+  exit 1
+fi
+
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  export PYTHONPATH="${EAGLE_DIR}:${PYTHONPATH}"
+else
+  export PYTHONPATH="${EAGLE_DIR}"
+fi
+
 if [[ $# -lt 4 ]]; then
   echo "Usage: $0 <base_model_path> <ea_model_path> <question_file.jsonl> <answer_file.jsonl>"
   exit 1
@@ -23,6 +37,7 @@ LAYERED_PROBE_SAMPLES="${LAYERED_PROBE_SAMPLES:-0}"
 LAYERED_PROBE_DEVICE="${LAYERED_PROBE_DEVICE:-cpu}"    # same/auto/cuda/cpu
 LAYERED_PROBE_DTYPE="${LAYERED_PROBE_DTYPE:-auto}"     # auto/bf16/fp16/fp32
 LAYERED_PROBE_OUTPUT="${LAYERED_PROBE_OUTPUT:-}"
+LAYERED_PROBE_LOG_EVERY="${LAYERED_PROBE_LOG_EVERY:-1}"
 LAYERED_PROBE_ONLY="${LAYERED_PROBE_ONLY:-0}"          # 1/0
 WARMUP="${WARMUP:-1}"                         # 1/0
 WARMUP_DECODE_MODE="${WARMUP_DECODE_MODE:-auto}" # auto/eagle/naive/hf
@@ -92,41 +107,45 @@ if [[ "${LAYERED_PROBE_ONLY}" == "1" || "${LAYERED_PROBE_ONLY}" == "true" ]]; th
   layered_probe_only_flag="--layered-probe-only"
 fi
 
-python -m eagle.evaluation.gen_ea_answer_qwen3_bird \
-  --base-model-path "$BASE_MODEL_PATH" \
-  --ea-model-path "$EA_MODEL_PATH" \
-  --question-file "$QUESTION_FILE" \
-  --answer-file "$ANSWER_FILE" \
-  --max-new-token "$MAX_NEW_TOKEN" \
-  --total-token "$TOTAL_TOKEN" \
-  --depth "$DEPTH" \
-  --top-k "$TOP_K" \
-  --decode-mode "$DECODE_MODE" \
-  --layered-probe-samples "$LAYERED_PROBE_SAMPLES" \
-  --layered-probe-device "$LAYERED_PROBE_DEVICE" \
-  --layered-probe-dtype "$LAYERED_PROBE_DTYPE" \
-  --layered-probe-output "$LAYERED_PROBE_OUTPUT" \
-  ${layered_probe_only_flag} \
-  ${warmup_flag} \
-  --warmup-decode-mode "$WARMUP_DECODE_MODE" \
-  ${warmup_probe_flag} \
-  ${hard_reset_after_warmup_flag} \
-  ${hard_reset_before_probe_flag} \
-  ${hard_reset_before_generate_flag} \
-  ${log_state_snapshot_flag} \
-  --attn-implementation "$ATTN_IMPLEMENTATION" \
-  --debug-token-dump "$DEBUG_TOKEN_DUMP" \
-  --logits-probe-samples "$LOGITS_PROBE_SAMPLES" \
-  --diag-log-first-samples "$DIAG_LOG_FIRST_SAMPLES" \
-  --diag-log-invalid-max "$DIAG_LOG_INVALID_MAX" \
-  --diag-raw-preview-chars "$DIAG_RAW_PREVIEW_CHARS" \
-  --degenerate-window "$DEGENERATE_WINDOW" \
-  ${abort_flag} \
-  ${reset_kv_flag} \
-  --temperature 0 \
-  --device "$DEVICE" \
-  ${device_map_flag} \
-  --kv-cache-min-length "$KV_CACHE_MIN_LENGTH" \
-  --kv-cache-margin "$KV_CACHE_MARGIN" \
-  --max-samples "$MAX_SAMPLES" \
-  --bf16
+(
+  cd "${EAGLE_DIR}"
+  python -m eagle.evaluation.gen_ea_answer_qwen3_bird \
+    --base-model-path "$BASE_MODEL_PATH" \
+    --ea-model-path "$EA_MODEL_PATH" \
+    --question-file "$QUESTION_FILE" \
+    --answer-file "$ANSWER_FILE" \
+    --max-new-token "$MAX_NEW_TOKEN" \
+    --total-token "$TOTAL_TOKEN" \
+    --depth "$DEPTH" \
+    --top-k "$TOP_K" \
+    --decode-mode "$DECODE_MODE" \
+    --layered-probe-samples "$LAYERED_PROBE_SAMPLES" \
+    --layered-probe-device "$LAYERED_PROBE_DEVICE" \
+    --layered-probe-dtype "$LAYERED_PROBE_DTYPE" \
+    --layered-probe-output "$LAYERED_PROBE_OUTPUT" \
+    --layered-probe-log-every "$LAYERED_PROBE_LOG_EVERY" \
+    ${layered_probe_only_flag} \
+    ${warmup_flag} \
+    --warmup-decode-mode "$WARMUP_DECODE_MODE" \
+    ${warmup_probe_flag} \
+    ${hard_reset_after_warmup_flag} \
+    ${hard_reset_before_probe_flag} \
+    ${hard_reset_before_generate_flag} \
+    ${log_state_snapshot_flag} \
+    --attn-implementation "$ATTN_IMPLEMENTATION" \
+    --debug-token-dump "$DEBUG_TOKEN_DUMP" \
+    --logits-probe-samples "$LOGITS_PROBE_SAMPLES" \
+    --diag-log-first-samples "$DIAG_LOG_FIRST_SAMPLES" \
+    --diag-log-invalid-max "$DIAG_LOG_INVALID_MAX" \
+    --diag-raw-preview-chars "$DIAG_RAW_PREVIEW_CHARS" \
+    --degenerate-window "$DEGENERATE_WINDOW" \
+    ${abort_flag} \
+    ${reset_kv_flag} \
+    --temperature 0 \
+    --device "$DEVICE" \
+    ${device_map_flag} \
+    --kv-cache-min-length "$KV_CACHE_MIN_LENGTH" \
+    --kv-cache-margin "$KV_CACHE_MARGIN" \
+    --max-samples "$MAX_SAMPLES" \
+    --bf16
+)

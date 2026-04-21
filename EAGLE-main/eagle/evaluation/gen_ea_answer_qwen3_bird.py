@@ -546,6 +546,21 @@ def _load_kv_rewrite_model(base_model_path: str, *, torch_dtype: torch.dtype, at
     return KVMixtralForCausalLM.from_pretrained(base_model_path, **load_kwargs)
 
 
+def _is_cuda_oom_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    if "cuda out of memory" in msg:
+        return True
+    if "outofmemoryerror" in type(err).__name__.lower():
+        return True
+    torch_oom = getattr(torch, "OutOfMemoryError", None)
+    if torch_oom is not None and isinstance(err, torch_oom):
+        return True
+    cuda_oom = getattr(torch.cuda, "OutOfMemoryError", None)
+    if cuda_oom is not None and isinstance(err, cuda_oom):
+        return True
+    return False
+
+
 def _prepare_layered_probe_inputs(samples: list[dict[str, Any]], tokenizer, n_samples: int) -> list[dict[str, Any]]:
     inputs: list[dict[str, Any]] = []
     n = max(0, int(n_samples))
@@ -656,9 +671,16 @@ def _run_layer_probe_for_model(
     tokenizer,
     probe_inputs: list[dict[str, Any]],
     fallback_device: torch.device,
+    progress_layer_index: int = 1,
+    progress_layer_total: int = 1,
+    progress_global_offset: int = 0,
+    progress_global_total: int = 0,
+    progress_log_every: int = 1,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for item in probe_inputs:
+    n_inputs = len(probe_inputs)
+    log_every = max(1, int(progress_log_every))
+    for idx, item in enumerate(probe_inputs, start=1):
         input_device = _model_input_device_from_model(forward_model, fallback_device)
         enc = {k: v.to(input_device) for k, v in item["enc_cpu"].items()}
         _reset_tree_state_on_base_model(forward_model)
@@ -672,6 +694,29 @@ def _run_layer_probe_for_model(
             "probe": probe,
         }
         records.append(rec)
+        if (
+            idx == 1
+            or idx == n_inputs
+            or (idx % log_every) == 0
+        ):
+            if progress_global_total > 0:
+                global_step = int(progress_global_offset + idx)
+                progress_pct = 100.0 * float(global_step) / float(progress_global_total)
+                print(
+                    "[layered-probe-progress] "
+                    f"layer={layer_name} "
+                    f"layer_step={progress_layer_index}/{progress_layer_total} "
+                    f"sample={idx}/{n_inputs} "
+                    f"global={global_step}/{progress_global_total} "
+                    f"progress={progress_pct:.1f}%"
+                )
+            else:
+                print(
+                    "[layered-probe-progress] "
+                    f"layer={layer_name} "
+                    f"layer_step={progress_layer_index}/{progress_layer_total} "
+                    f"sample={idx}/{n_inputs}"
+                )
     return records
 
 
@@ -700,15 +745,20 @@ def _run_layered_probe_stack(
 
     probe_device = _resolve_layered_probe_device(args, runtime_device)
     probe_dtype = _resolve_layered_probe_dtype(args, probe_device)
+    progress_log_every = max(1, int(getattr(args, "layered_probe_log_every", 1)))
     probe_tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, use_fast=False)
     probe_inputs = _prepare_layered_probe_inputs(samples, probe_tokenizer, n_samples)
     if not probe_inputs:
         return None
 
+    layer_total = 3
+    total_probe_steps = int(len(probe_inputs) * layer_total)
     print(
         "[layered-probe] "
         f"enabled=1 n_samples={len(probe_inputs)} "
-        f"probe_device={probe_device} probe_dtype={probe_dtype}"
+        f"probe_device={probe_device} probe_dtype={probe_dtype} "
+        f"progress_log_every={progress_log_every} "
+        f"expected_steps={total_probe_steps}"
     )
 
     records: list[dict[str, Any]] = []
@@ -725,17 +775,25 @@ def _run_layered_probe_stack(
             tokenizer=probe_tokenizer,
             probe_inputs=probe_inputs,
             fallback_device=runtime_device,
+            progress_layer_index=1,
+            progress_layer_total=layer_total,
+            progress_global_offset=0,
+            progress_global_total=total_probe_steps,
+            progress_log_every=progress_log_every,
         )
     )
 
     # Probe HF native path.
     hf_native = None
-    try:
-        print("[layered-probe] loading hf_native model...")
-        load_kwargs: dict[str, Any] = {"torch_dtype": probe_dtype}
+    def _load_hf_native_model(load_dtype: torch.dtype):
+        load_kwargs: dict[str, Any] = {"torch_dtype": load_dtype}
         if args.attn_implementation:
             load_kwargs["attn_implementation"] = args.attn_implementation
-        hf_native = AutoModelForCausalLM.from_pretrained(args.base_model_path, **load_kwargs)
+        return AutoModelForCausalLM.from_pretrained(args.base_model_path, **load_kwargs)
+
+    try:
+        print("[layered-probe] loading hf_native model...")
+        hf_native = _load_hf_native_model(probe_dtype)
         if probe_device.type != "cpu":
             hf_native = hf_native.to(probe_device)
         hf_native.eval()
@@ -746,19 +804,63 @@ def _run_layered_probe_stack(
                 tokenizer=probe_tokenizer,
                 probe_inputs=probe_inputs,
                 fallback_device=probe_device,
+                progress_layer_index=2,
+                progress_layer_total=layer_total,
+                progress_global_offset=len(probe_inputs),
+                progress_global_total=total_probe_steps,
+                progress_log_every=progress_log_every,
             )
         )
     except Exception as e:
-        records.append(
-            {
-                "layer": "hf_native",
-                "sample_index": -1,
-                "question_id": None,
-                "db_id": None,
-                "prompt_tokens": 0,
-                "probe": {"probe_error": f"{type(e).__name__}: {e}"},
-            }
-        )
+        if probe_device.type == "cuda" and _is_cuda_oom_error(e):
+            print("[layered-probe] hf_native CUDA OOM; fallback to CPU/FP32 and retry...")
+            _cleanup_forward_model(hf_native)
+            hf_native = None
+            try:
+                hf_native = _load_hf_native_model(torch.float32)
+                hf_native = hf_native.to(torch.device("cpu"))
+                hf_native.eval()
+                records.extend(
+                    _run_layer_probe_for_model(
+                        layer_name="hf_native",
+                        forward_model=hf_native,
+                        tokenizer=probe_tokenizer,
+                        probe_inputs=probe_inputs,
+                        fallback_device=torch.device("cpu"),
+                        progress_layer_index=2,
+                        progress_layer_total=layer_total,
+                        progress_global_offset=len(probe_inputs),
+                        progress_global_total=total_probe_steps,
+                        progress_log_every=progress_log_every,
+                    )
+                )
+            except Exception as e2:
+                records.append(
+                    {
+                        "layer": "hf_native",
+                        "sample_index": -1,
+                        "question_id": None,
+                        "db_id": None,
+                        "prompt_tokens": 0,
+                        "probe": {
+                            "probe_error": (
+                                f"{type(e).__name__}: {e} | "
+                                f"cpu_fallback_failed: {type(e2).__name__}: {e2}"
+                            )
+                        },
+                    }
+                )
+        else:
+            records.append(
+                {
+                    "layer": "hf_native",
+                    "sample_index": -1,
+                    "question_id": None,
+                    "db_id": None,
+                    "prompt_tokens": 0,
+                    "probe": {"probe_error": f"{type(e).__name__}: {e}"},
+                }
+            )
     finally:
         _cleanup_forward_model(hf_native)
 
@@ -781,19 +883,67 @@ def _run_layered_probe_stack(
                 tokenizer=probe_tokenizer,
                 probe_inputs=probe_inputs,
                 fallback_device=probe_device,
+                progress_layer_index=3,
+                progress_layer_total=layer_total,
+                progress_global_offset=2 * len(probe_inputs),
+                progress_global_total=total_probe_steps,
+                progress_log_every=progress_log_every,
             )
         )
     except Exception as e:
-        records.append(
-            {
-                "layer": "kv_rewrite",
-                "sample_index": -1,
-                "question_id": None,
-                "db_id": None,
-                "prompt_tokens": 0,
-                "probe": {"probe_error": f"{type(e).__name__}: {e}"},
-            }
-        )
+        if probe_device.type == "cuda" and _is_cuda_oom_error(e):
+            print("[layered-probe] kv_rewrite CUDA OOM; fallback to CPU/FP32 and retry...")
+            _cleanup_forward_model(kv_rewrite)
+            kv_rewrite = None
+            try:
+                kv_rewrite = _load_kv_rewrite_model(
+                    args.base_model_path,
+                    torch_dtype=torch.float32,
+                    attn_implementation=args.attn_implementation,
+                )
+                kv_rewrite = kv_rewrite.to(torch.device("cpu"))
+                kv_rewrite.eval()
+                records.extend(
+                    _run_layer_probe_for_model(
+                        layer_name="kv_rewrite",
+                        forward_model=kv_rewrite,
+                        tokenizer=probe_tokenizer,
+                        probe_inputs=probe_inputs,
+                        fallback_device=torch.device("cpu"),
+                        progress_layer_index=3,
+                        progress_layer_total=layer_total,
+                        progress_global_offset=2 * len(probe_inputs),
+                        progress_global_total=total_probe_steps,
+                        progress_log_every=progress_log_every,
+                    )
+                )
+            except Exception as e2:
+                records.append(
+                    {
+                        "layer": "kv_rewrite",
+                        "sample_index": -1,
+                        "question_id": None,
+                        "db_id": None,
+                        "prompt_tokens": 0,
+                        "probe": {
+                            "probe_error": (
+                                f"{type(e).__name__}: {e} | "
+                                f"cpu_fallback_failed: {type(e2).__name__}: {e2}"
+                            )
+                        },
+                    }
+                )
+        else:
+            records.append(
+                {
+                    "layer": "kv_rewrite",
+                    "sample_index": -1,
+                    "question_id": None,
+                    "db_id": None,
+                    "prompt_tokens": 0,
+                    "probe": {"probe_error": f"{type(e).__name__}: {e}"},
+                }
+            )
     finally:
         _cleanup_forward_model(kv_rewrite)
 
@@ -1394,6 +1544,7 @@ def main():
     parser.add_argument("--layered-probe-device", type=str, default="cpu", choices=["same", "auto", "cuda", "cpu"])
     parser.add_argument("--layered-probe-dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"])
     parser.add_argument("--layered-probe-output", type=str, default="")
+    parser.add_argument("--layered-probe-log-every", type=int, default=1)
     parser.add_argument("--layered-probe-only", action="store_true")
     parser.add_argument("--warmup", dest="warmup", action="store_true")
     parser.add_argument("--no-warmup", dest="warmup", action="store_false")

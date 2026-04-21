@@ -30,6 +30,7 @@ LAYERED_PROBE_SAMPLES="${LAYERED_PROBE_SAMPLES:-0}"
 LAYERED_PROBE_DEVICE="${LAYERED_PROBE_DEVICE:-cpu}"    # same/auto/cuda/cpu
 LAYERED_PROBE_DTYPE="${LAYERED_PROBE_DTYPE:-auto}"     # auto/bf16/fp16/fp32
 LAYERED_PROBE_OUTPUT="${LAYERED_PROBE_OUTPUT:-}"        # empty => pred_jsonl.layered_probe.json
+LAYERED_PROBE_LOG_EVERY="${LAYERED_PROBE_LOG_EVERY:-1}" # log progress every N samples
 LAYERED_PROBE_ONLY="${LAYERED_PROBE_ONLY:-0}"           # 1/0
 WARMUP="${WARMUP:-1}"                         # 1/0
 WARMUP_DECODE_MODE="${WARMUP_DECODE_MODE:-auto}" # auto/eagle/naive/hf
@@ -309,6 +310,11 @@ EA_MODEL_PATH="$(resolve_ea_model_path "${EA_MODEL_PATH_INPUT}")"
 [[ -d "${BIRD_DEV_DB_ROOT}" ]] || die "BIRD_DEV_DB_ROOT not found: ${BIRD_DEV_DB_ROOT}"
 is_valid_ea_ckpt_dir "${EA_MODEL_PATH}" || die "EA_MODEL_PATH invalid checkpoint dir (need config.json + model.safetensors/pytorch_model.bin): ${EA_MODEL_PATH}"
 
+PYTHONPATH_FOR_INFER="${EAGLE_DIR}"
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  PYTHONPATH_FOR_INFER="${EAGLE_DIR}:${PYTHONPATH}"
+fi
+
 log "paths root=${ROOT_DIR} eagle=${EAGLE_DIR}"
 if [[ "${EA_MODEL_PATH}" != "${EA_MODEL_PATH_INPUT}" ]]; then
   log "models base_model=${BASE_MODEL_PATH} ea_model_input=${EA_MODEL_PATH_INPUT}"
@@ -323,7 +329,7 @@ log "outputs summary_json=${SUMMARY_JSON} failures_jsonl=${FAILURES_JSONL} repor
 log "eval timeout_sec=${TIMEOUT_SEC}"
 log "infer runtime device=${DEVICE} device_map_auto=${DEVICE_MAP_AUTO} kv_cache_min_length=${KV_CACHE_MIN_LENGTH} kv_cache_margin=${KV_CACHE_MARGIN}"
 log "infer decode mode=${DECODE_MODE} attn_impl=${ATTN_IMPLEMENTATION} max_new_token=${MAX_NEW_TOKEN} total_token=${TOTAL_TOKEN} depth=${DEPTH} top_k=${TOP_K} max_samples=${MAX_SAMPLES}"
-log "infer layered_probe samples=${LAYERED_PROBE_SAMPLES} device=${LAYERED_PROBE_DEVICE} dtype=${LAYERED_PROBE_DTYPE} output=${LAYERED_PROBE_OUTPUT:-auto} probe_only=${LAYERED_PROBE_ONLY}"
+log "infer layered_probe samples=${LAYERED_PROBE_SAMPLES} device=${LAYERED_PROBE_DEVICE} dtype=${LAYERED_PROBE_DTYPE} output=${LAYERED_PROBE_OUTPUT:-auto} log_every=${LAYERED_PROBE_LOG_EVERY} probe_only=${LAYERED_PROBE_ONLY}"
 log "infer warmup warmup=${WARMUP} warmup_mode=${WARMUP_DECODE_MODE} warmup_probe=${WARMUP_PROBE} hard_reset_after_warmup=${HARD_RESET_AFTER_WARMUP}"
 log "infer state hard_reset_before_probe=${HARD_RESET_BEFORE_PROBE} hard_reset_before_generate=${HARD_RESET_BEFORE_GENERATE} log_state_snapshot=${LOG_STATE_SNAPSHOT}"
 log "infer strict checks head_load=${EAGLE_STRICT_HEAD_LOAD} draft_map=${EAGLE_STRICT_DRAFT_MAP}"
@@ -339,6 +345,8 @@ log "[1/4] prepare BIRD dev json -> jsonl"
 )
 
 log "[2/4] run EAGLE3 accelerated inference"
+PYTHONPATH="${PYTHONPATH_FOR_INFER}" \
+EAGLE_DIR="${EAGLE_DIR}" \
 DEVICE="${DEVICE}" \
 DEVICE_MAP_AUTO="${DEVICE_MAP_AUTO}" \
 KV_CACHE_MIN_LENGTH="${KV_CACHE_MIN_LENGTH}" \
@@ -352,6 +360,7 @@ LAYERED_PROBE_SAMPLES="${LAYERED_PROBE_SAMPLES}" \
 LAYERED_PROBE_DEVICE="${LAYERED_PROBE_DEVICE}" \
 LAYERED_PROBE_DTYPE="${LAYERED_PROBE_DTYPE}" \
 LAYERED_PROBE_OUTPUT="${LAYERED_PROBE_OUTPUT}" \
+LAYERED_PROBE_LOG_EVERY="${LAYERED_PROBE_LOG_EVERY}" \
 LAYERED_PROBE_ONLY="${LAYERED_PROBE_ONLY}" \
 WARMUP="${WARMUP}" \
 WARMUP_DECODE_MODE="${WARMUP_DECODE_MODE}" \

@@ -1,16 +1,27 @@
 from __future__ import annotations
 
+import importlib
+import os
 from typing import Any
 
 import torch
 
 
-DEFAULT_SYSTEM_PROMPT = (
+GENERIC_SYSTEM_PROMPT = (
     "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, "
     "while being safe. Your answers should not include any harmful, unethical, racist, sexist, toxic, "
     "dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\n"
     "If a question does not make any sense, or is not factually coherent, explain why instead of answering "
     "something not correct. If you don't know the answer to a question, please don't share false information."
+)
+
+
+FALLBACK_BIRD_SYSTEM_PROMPT = (
+    "You are a SQLite Text-to-SQL generator for the BIRD benchmark.\n"
+    "Given [SCHEMA], [DATABASE DESCRIPTION], [EVIDENCE], and [QUESTION], return exactly one executable SQLite SQL statement.\n"
+    "Return SQL only. No explanation, no markdown, no list/bullet/number sequence.\n"
+    "The SQL must start with SELECT or WITH and use only tables/columns from [SCHEMA].\n"
+    "Use [EVIDENCE] and [DATABASE DESCRIPTION] to resolve ambiguous terms."
 )
 
 ROLE_MAP = {
@@ -19,6 +30,43 @@ ROLE_MAP = {
     "gpt": "assistant",
     "assistant": "assistant",
 }
+
+
+def _load_bird_system_prompt() -> str:
+    module_candidates = (
+        "eagle.text2sql.bird.prompt_builder",
+        "text2sql.bird.prompt_builder",
+    )
+    for module_name in module_candidates:
+        try:
+            mod = importlib.import_module(module_name)
+        except Exception:
+            continue
+        val = getattr(mod, "SYSTEM_PROMPT", None)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return FALLBACK_BIRD_SYSTEM_PROMPT
+
+
+def resolve_system_prompt(mode_or_prompt: str | None = None) -> str:
+    """Resolve system prompt mode for training data tokenization.
+
+    Supported modes:
+    - auto/bird/sql : use BIRD Text-to-SQL system prompt.
+    - generic       : use legacy generic assistant prompt.
+    - any other non-empty string is treated as a literal custom prompt.
+    """
+
+    raw = (mode_or_prompt or "auto").strip()
+    mode = raw.lower()
+    if mode in {"", "auto", "bird", "sql"}:
+        return _load_bird_system_prompt()
+    if mode in {"generic", "assistant"}:
+        return GENERIC_SYSTEM_PROMPT
+    return raw
+
+
+DEFAULT_SYSTEM_PROMPT = resolve_system_prompt(os.environ.get("EAGLE_TRAIN_SYSTEM_PROMPT", "auto"))
 
 
 def _normalize_turns(source: list[dict[str, Any]] | None) -> list[dict[str, str]]:
@@ -62,7 +110,7 @@ def build_tokenized_sample(
     tokenizer,
     source: list[dict[str, Any]] | None,
     max_len: int,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    system_prompt: str | None = None,
 ) -> dict[str, torch.Tensor] | None:
     turns = _normalize_turns(source)
     if not turns:
@@ -71,7 +119,7 @@ def build_tokenized_sample(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id or tokenizer.unk_token_id
 
-    system_msg = {"role": "system", "content": system_prompt}
+    system_msg = {"role": "system", "content": (system_prompt or DEFAULT_SYSTEM_PROMPT)}
     full_messages = [system_msg] + turns
     conversation = tokenizer.apply_chat_template(
         full_messages,
