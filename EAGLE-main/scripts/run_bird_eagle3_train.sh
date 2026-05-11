@@ -20,9 +20,9 @@ DS_RUNTIME_CONFIG="${DS_RUNTIME_CONFIG:-${WORKDIR}/ds_config.runtime.json}"
 
 EVAL_RATIO="${EVAL_RATIO:-0.02}"
 SEED="${SEED:-42}"
-NUM_EPOCHS="${NUM_EPOCHS:-40}"
+NUM_EPOCHS="${NUM_EPOCHS:-20}"
 MAX_LEN="${MAX_LEN:-2048}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
+NUM_WORKERS="${NUM_WORKERS:-0}"
 PREPROCESS_NUM_PROC="${PREPROCESS_NUM_PROC:-8}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-1}"
@@ -69,6 +69,7 @@ GLOBAL_STALL_SECONDS="${GLOBAL_STALL_SECONDS:-1200}"
 ABORT_ON_GLOBAL_STALL="${ABORT_ON_GLOBAL_STALL:-1}"
 STALL_DIAGNOSTICS="${STALL_DIAGNOSTICS:-1}"
 STALL_DIAGNOSTICS_COOLDOWN="${STALL_DIAGNOSTICS_COOLDOWN:-300}"
+EAGLE_DIST_SANITY_CHECK="${EAGLE_DIST_SANITY_CHECK:-1}"
 
 # DeepSpeed ZeRO communication safety knobs.
 # overlap_comm=true can improve throughput but is a common source of late-stage NCCL hangs.
@@ -81,6 +82,7 @@ DS_ALLGATHER_BUCKET_SIZE="${DS_ALLGATHER_BUCKET_SIZE:-}"
 NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
 TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 NCCL_BLOCKING_WAIT="${NCCL_BLOCKING_WAIT:-1}"
+TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-${NCCL_BLOCKING_WAIT}}"
 NCCL_DEBUG="${NCCL_DEBUG:-}"
 NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,ENV}"
 NCCL_TRACE_COLL="${NCCL_TRACE_COLL:-0}"
@@ -112,6 +114,19 @@ TRAIN_PREP_JSONL="${TRAIN_PREP_JSONL:-${WORKDIR}/bird_train_prep.jsonl}"
 TRAIN_CHAT_JSONL="${TRAIN_CHAT_JSONL:-${WORKDIR}/bird_train_chat.jsonl}"
 EVAL_CHAT_JSONL="${EVAL_CHAT_JSONL:-${WORKDIR}/bird_eval_chat.jsonl}"
 
+OFFLINE_TOKENIZED_ENABLE="${OFFLINE_TOKENIZED_ENABLE:-1}"
+OFFLINE_TOKENIZED_FORCE_REBUILD="${OFFLINE_TOKENIZED_FORCE_REBUILD:-0}"
+OFFLINE_TOKENIZED_STRICT="${OFFLINE_TOKENIZED_STRICT:-${OFFLINE_TOKENIZED_ENABLE}}"
+OFFLINE_TOKENIZED_DIR="${OFFLINE_TOKENIZED_DIR:-${WORKDIR}/tokenized_dataset}"
+TRAIN_TOKENIZED_DIR="${TRAIN_TOKENIZED_DIR:-${OFFLINE_TOKENIZED_DIR}/train}"
+EVAL_TOKENIZED_DIR="${EVAL_TOKENIZED_DIR:-${OFFLINE_TOKENIZED_DIR}/eval}"
+OFFLINE_TOKENIZED_STAGE_LOCAL="${OFFLINE_TOKENIZED_STAGE_LOCAL:-0}"
+OFFLINE_TOKENIZED_LOCAL_ROOT="${OFFLINE_TOKENIZED_LOCAL_ROOT:-/dev/shm/${USER:-u$(id -u)}/eagle_tokenized}"
+OFFLINE_TOKENIZED_STAGE_CLEANUP="${OFFLINE_TOKENIZED_STAGE_CLEANUP:-1}"
+TRAIN_TOKENIZED_PATH_EFFECTIVE=""
+EVAL_TOKENIZED_PATH_EFFECTIVE=""
+STAGE_LOCAL_SESSION_ROOT=""
+
 LOG_FILE="${LOG_FILE:-${WORKDIR}/run_bird_eagle3_train.log}"
 
 # -----------------------------
@@ -125,6 +140,42 @@ die() {
   echo "[$(date '+%F %T')] ERROR: $*" | tee -a "${LOG_FILE}" >&2
   exit 1
 }
+
+sync_directory() {
+  local src="$1"
+  local dst="$2"
+  if command -v rsync >/dev/null 2>&1; then
+    mkdir -p "${dst}"
+    rsync -a --delete "${src}/" "${dst}/"
+  else
+    rm -rf "${dst}"
+    mkdir -p "$(dirname "${dst}")"
+    cp -a "${src}" "${dst}"
+  fi
+}
+
+to_abs_path() {
+  local p="$1"
+  python - "$p" <<'PY'
+import os
+import sys
+print(os.path.abspath(sys.argv[1]))
+PY
+}
+
+cleanup_local_stage() {
+  if [[ -n "${STAGE_LOCAL_SESSION_ROOT}" && -d "${STAGE_LOCAL_SESSION_ROOT}" ]]; then
+    rm -rf "${STAGE_LOCAL_SESSION_ROOT}" || true
+  fi
+}
+
+# Normalize dataloader knobs for single-process loading.
+if [[ "${NUM_WORKERS}" -le 0 ]]; then
+  NUM_WORKERS=0
+  PERSISTENT_WORKERS=0
+  PREFETCH_FACTOR=0
+  DATALOADER_TIMEOUT=0
+fi
 
 # -----------------------------
 # Preflight
@@ -169,25 +220,19 @@ export PYTHONPATH="${EAGLE_DIR}:${PYTHONPATH:-}"
 export NCCL_ASYNC_ERROR_HANDLING
 export TORCH_NCCL_ASYNC_ERROR_HANDLING
 export NCCL_BLOCKING_WAIT
+export TORCH_NCCL_BLOCKING_WAIT
 export NCCL_DEBUG
 export NCCL_DEBUG_SUBSYS
 export TORCH_DISTRIBUTED_DEBUG
 export PYTHONFAULTHANDLER
 export EAGLE_LOG_ALL_RANKS
+export EAGLE_DIST_SANITY_CHECK
 
-log "paths root=${ROOT_DIR} eagle=${EAGLE_DIR} base_model=${BASE_MODEL_PATH}"
-log "data train_json=${BIRD_TRAIN_JSON} train_db_root=${BIRD_TRAIN_DB_ROOT}"
-log "artifacts workdir=${WORKDIR} save_dir=${SAVE_DIR} log=${LOG_FILE}"
-log "train epochs=${NUM_EPOCHS} max_len=${MAX_LEN} workers=${NUM_WORKERS} preprocess_num_proc=${PREPROCESS_NUM_PROC} eval_ratio=${EVAL_RATIO} seed=${SEED}"
-log "optim warmup_ratio=${WARMUP_RATIO} save_every_epochs=${SAVE_EVERY_EPOCHS} save_ds_every_epochs=${SAVE_DS_EVERY_EPOCHS}"
-log "runtime diag=${EAGLE_DIAG_MODE} heartbeat=${HEARTBEAT_STEPS} slow_stage_s=${SLOW_STAGE_SECONDS} dataloader_timeout_s=${DATALOADER_TIMEOUT} pin_memory=${PIN_MEMORY} persistent_workers=${PERSISTENT_WORKERS} prefetch_factor=${PREFETCH_FACTOR} in_order=${DATALOADER_IN_ORDER}"
-log "runtime extras max_train_steps=${MAX_TRAIN_STEPS} max_eval_steps=${MAX_EVAL_STEPS} empty_cache_every_steps=${EMPTY_CACHE_EVERY_STEPS} cuda_sync_heartbeat_steps=${CUDA_SYNC_HEARTBEAT_STEPS} log_all_ranks=${EAGLE_LOG_ALL_RANKS}"
-log "runtime stall_guard global_stall_seconds=${GLOBAL_STALL_SECONDS} abort_on_global_stall=${ABORT_ON_GLOBAL_STALL} stall_diagnostics=${STALL_DIAGNOSTICS} stall_diag_cooldown=${STALL_DIAGNOSTICS_COOLDOWN}"
-log "deepspeed zero overlap_comm=${DS_OVERLAP_COMM} contiguous_gradients=${DS_CONTIGUOUS_GRADIENTS} reduce_bucket=${DS_REDUCE_BUCKET_SIZE:-<keep-default>} allgather_bucket=${DS_ALLGATHER_BUCKET_SIZE:-<keep-default>}"
-log "distributed nccl_debug=${NCCL_DEBUG} nccl_debug_subsys=${NCCL_DEBUG_SUBSYS} nccl_trace_coll=${NCCL_TRACE_COLL} torch_dist_debug=${TORCH_DISTRIBUTED_DEBUG} blocking_wait=${NCCL_BLOCKING_WAIT}"
-log "safety fail_fast_nonfinite=${EAGLE_FAIL_FAST_ON_MODEL_NONFINITE} disable_autoresume=${EAGLE_DISABLE_AUTORESUME} require_qwen_kv=${REQUIRE_QWEN_KV} use_padding_attn_mask=${EAGLE_USE_PADDING_ATTN_MASK}"
-log "alignment teacher_impl=${EAGLE_QWEN_TEACHER_IMPL} strict_teacher_impl=${EAGLE_STRICT_TEACHER_IMPL} teacher_hidden_selector=${EAGLE_TEACHER_HIDDEN_SELECTOR} teacher_hidden_custom=${EAGLE_TEACHER_HIDDEN_CUSTOM:-<none>} train_system_prompt=${EAGLE_TRAIN_SYSTEM_PROMPT}"
-log "alignment loss_mode=${EAGLE_LOSS_MODE} gold_ce_weight=${EAGLE_GOLD_CE_WEIGHT} distill_only_in_draft=${EAGLE_DISTILL_ONLY_IN_DRAFT} rollout_mode=${EAGLE_INPUT_ROLLOUT_MODE} rollout_ratio=(${EAGLE_INPUT_ROLLOUT_RATIO_START}->${EAGLE_INPUT_ROLLOUT_RATIO_END}) rollout_align_target=${EAGLE_INPUT_ROLLOUT_ALIGN_TARGET}"
+log "CONFIG paths: root=${ROOT_DIR} model=${BASE_MODEL_PATH} workdir=${WORKDIR} save=${SAVE_DIR}"
+log "CONFIG train: epochs=${NUM_EPOCHS} max_len=${MAX_LEN} seed=${SEED} eval_ratio=${EVAL_RATIO} warmup=${WARMUP_RATIO} workers=${NUM_WORKERS}"
+log "CONFIG runtime: heartbeat=${HEARTBEAT_STEPS} slow_stage=${SLOW_STAGE_SECONDS}s stall_guard=${GLOBAL_STALL_SECONDS}s max_train_steps=${MAX_TRAIN_STEPS} max_eval_steps=${MAX_EVAL_STEPS} diag=${EAGLE_DIAG_MODE}"
+log "CONFIG offline_tokenized: enable=${OFFLINE_TOKENIZED_ENABLE} stage_local=${OFFLINE_TOKENIZED_STAGE_LOCAL} dir=${OFFLINE_TOKENIZED_DIR}"
+log "CONFIG alignment: loss=${EAGLE_LOSS_MODE} teacher=${EAGLE_QWEN_TEACHER_IMPL} hidden=${EAGLE_TEACHER_HIDDEN_SELECTOR} rollout=${EAGLE_INPUT_ROLLOUT_MODE}(${EAGLE_INPUT_ROLLOUT_RATIO_START}->${EAGLE_INPUT_ROLLOUT_RATIO_END}) gold_ce=${EAGLE_GOLD_CE_WEIGHT}"
 
 [[ -d "${EAGLE_DIR}" ]] || die "EAGLE_DIR not found: ${EAGLE_DIR}"
 [[ -d "${BASE_MODEL_PATH}" ]] || die "BASE_MODEL_PATH not found: ${BASE_MODEL_PATH}"
@@ -314,6 +359,33 @@ PY
 else
   echo "${CHECK_ERR_MSG}" | tee -a "${LOG_FILE}"
 fi
+
+# Python dependency preflight for data pipeline and offline tokenized path.
+CHECK_ERR_MSG=""
+if ! CHECK_ERR_MSG="$(python - <<'PY' 2>&1
+try:
+    import datasets  # noqa: F401
+except Exception as e:
+    raise SystemExit(f"datasets import failed: {e}")
+
+try:
+    import transformers  # noqa: F401
+except Exception as e:
+    raise SystemExit(f"transformers import failed: {e}")
+
+try:
+    import torch  # noqa: F401
+except Exception as e:
+    raise SystemExit(f"torch import failed: {e}")
+
+print("[preflight] datasets/transformers/torch import OK")
+PY
+ )"; then
+  echo "${CHECK_ERR_MSG}" | tee -a "${LOG_FILE}" >&2
+  die "python data dependency preflight failed. Please install required packages for tokenization/training."
+else
+  echo "${CHECK_ERR_MSG}" | tee -a "${LOG_FILE}"
+fi
 cd "${EAGLE_DIR}"
 
 # -----------------------------
@@ -397,6 +469,56 @@ if triple_fence > 0:
     raise SystemExit(f"triple-backtick labels detected: {triple_fence}/{rows}")
 PY
 
+if [[ "${OFFLINE_TOKENIZED_ENABLE}" == "1" ]]; then
+  log "step2.6: build offline tokenized dataset (train/eval)"
+  python -m eagle.traineagle3.build_tokenized_dataset \
+    --basepath "${BASE_MODEL_PATH}" \
+    --trainpath "${TRAIN_CHAT_JSONL}" \
+    --testpath "${EVAL_CHAT_JSONL}" \
+    --train-output-dir "${TRAIN_TOKENIZED_DIR}" \
+    --test-output-dir "${EVAL_TOKENIZED_DIR}" \
+    --max-len "${MAX_LEN}" \
+    --preprocess-num-proc "${PREPROCESS_NUM_PROC}" \
+    --seed "${SEED}" \
+    --system-prompt "${EAGLE_TRAIN_SYSTEM_PROMPT}" \
+    --force-rebuild "${OFFLINE_TOKENIZED_FORCE_REBUILD}" 2>&1 | tee -a "${LOG_FILE}"
+
+  [[ -d "${TRAIN_TOKENIZED_DIR}" ]] || die "offline train tokenized dir missing: ${TRAIN_TOKENIZED_DIR}"
+  [[ -d "${EVAL_TOKENIZED_DIR}" ]] || die "offline eval tokenized dir missing: ${EVAL_TOKENIZED_DIR}"
+  [[ -f "${TRAIN_TOKENIZED_DIR}/_eagle_tokenized_meta.json" ]] \
+    || die "offline train tokenized metadata missing: ${TRAIN_TOKENIZED_DIR}/_eagle_tokenized_meta.json"
+  [[ -f "${EVAL_TOKENIZED_DIR}/_eagle_tokenized_meta.json" ]] \
+    || die "offline eval tokenized metadata missing: ${EVAL_TOKENIZED_DIR}/_eagle_tokenized_meta.json"
+
+  TRAIN_TOKENIZED_PATH_EFFECTIVE="${TRAIN_TOKENIZED_DIR}"
+  EVAL_TOKENIZED_PATH_EFFECTIVE="${EVAL_TOKENIZED_DIR}"
+
+  if [[ "${OFFLINE_TOKENIZED_STAGE_LOCAL}" == "1" ]]; then
+    [[ -d "/dev/shm" ]] || die "OFFLINE_TOKENIZED_STAGE_LOCAL=1 but /dev/shm not found"
+    SESSION_TAG="$(date '+%Y%m%d_%H%M%S')_$$"
+    SESSION_LOCAL_ROOT="${OFFLINE_TOKENIZED_LOCAL_ROOT}/${SESSION_TAG}"
+    STAGE_LOCAL_SESSION_ROOT="${SESSION_LOCAL_ROOT}"
+    if [[ "${OFFLINE_TOKENIZED_STAGE_CLEANUP}" == "1" ]]; then
+      trap cleanup_local_stage EXIT
+    fi
+    LOCAL_TRAIN_DIR="${SESSION_LOCAL_ROOT}/train"
+    LOCAL_EVAL_DIR="${SESSION_LOCAL_ROOT}/eval"
+    log "step2.7: stage tokenized dataset to local fast path -> ${SESSION_LOCAL_ROOT}"
+    sync_directory "${TRAIN_TOKENIZED_DIR}" "${LOCAL_TRAIN_DIR}" || die "failed to stage train tokenized dataset"
+    sync_directory "${EVAL_TOKENIZED_DIR}" "${LOCAL_EVAL_DIR}" || die "failed to stage eval tokenized dataset"
+    TRAIN_TOKENIZED_PATH_EFFECTIVE="${LOCAL_TRAIN_DIR}"
+    EVAL_TOKENIZED_PATH_EFFECTIVE="${LOCAL_EVAL_DIR}"
+  fi
+
+  TRAIN_TOKENIZED_PATH_EFFECTIVE="$(to_abs_path "${TRAIN_TOKENIZED_PATH_EFFECTIVE}")"
+  EVAL_TOKENIZED_PATH_EFFECTIVE="$(to_abs_path "${EVAL_TOKENIZED_PATH_EFFECTIVE}")"
+  log "offline tokenized effective train=${TRAIN_TOKENIZED_PATH_EFFECTIVE}"
+  log "offline tokenized effective eval=${EVAL_TOKENIZED_PATH_EFFECTIVE}"
+else
+  TRAIN_TOKENIZED_PATH_EFFECTIVE=""
+  EVAL_TOKENIZED_PATH_EFFECTIVE=""
+fi
+
 log "step3: train EAGLE3 head (DeepSpeed)"
 (
   cd eagle/traineagle3
@@ -425,8 +547,12 @@ log "step3: train EAGLE3 head (DeepSpeed)"
     --basepath "${BASE_MODEL_PATH}" \
     --trainpath "${TRAIN_CHAT_JSONL}" \
     --testpath "${EVAL_CHAT_JSONL}" \
+    --train-tokenized-path "${TRAIN_TOKENIZED_PATH_EFFECTIVE}" \
+    --test-tokenized-path "${EVAL_TOKENIZED_PATH_EFFECTIVE}" \
+    --tokenized-load-strict "${OFFLINE_TOKENIZED_STRICT}" \
     --savedir "${SAVE_DIR}" \
     --num-epochs "${NUM_EPOCHS}" \
+    --seed "${SEED}" \
     --max-len "${MAX_LEN}" \
     --num-workers "${NUM_WORKERS}" \
     --preprocess-num-proc "${PREPROCESS_NUM_PROC}" \
@@ -455,4 +581,9 @@ log "step3: train EAGLE3 head (DeepSpeed)"
 log "SUCCESS"
 log "train chat jsonl: ${TRAIN_CHAT_JSONL}"
 log "eval chat jsonl:  ${EVAL_CHAT_JSONL}"
+log "train tokenized:  ${TRAIN_TOKENIZED_PATH_EFFECTIVE:-<disabled>}"
+log "eval tokenized:   ${EVAL_TOKENIZED_PATH_EFFECTIVE:-<disabled>}"
 log "checkpoint dir:   ${SAVE_DIR}"
+if [[ -n "${STAGE_LOCAL_SESSION_ROOT}" && "${OFFLINE_TOKENIZED_STAGE_CLEANUP}" != "1" ]]; then
+  log "local staged tokenized retained at: ${STAGE_LOCAL_SESSION_ROOT}"
+fi

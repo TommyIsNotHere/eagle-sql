@@ -177,11 +177,11 @@ def main() -> None:
         "ex_denominator": 0,
         "exec_accuracy": 0.0,
         "pred_executable_rate": 0.0,
-        "acceptance_samples": 0,
-        "acceptance_rate_mean": 0.0,
-        "acceptance_rate_token_weighted": 0.0,
+        "tau_samples": 0,
+        "tau_mean": 0.0,
+        "tau_global": 0.0,
         "accepted_tokens_sum": 0,
-        "proposed_tokens_sum": 0,
+        "tree_steps_sum": 0,
         "wall_time_samples": 0,
         "wall_time_avg_sec": 0.0,
         "failure_breakdown": {},
@@ -193,21 +193,20 @@ def main() -> None:
     }
 
     failures: list[dict[str, Any]] = []
-    acceptance_rate_sum = 0.0
+    tau_sum = 0.0
     wall_time_sum = 0.0
 
     for pr in preds:
         summary["total_preds"] += 1
-        acceptance_rate = _safe_float(pr.get("acceptance_rate"), default=-1.0)
-        if acceptance_rate >= 0.0:
-            summary["acceptance_samples"] += 1
-            acceptance_rate_sum += acceptance_rate
+        tau = _safe_float(pr.get("mean_accepted_length"), default=-1.0)
+        if tau > 0.0:
+            summary["tau_samples"] += 1
+            tau_sum += tau
 
         accepted_tokens = max(0, _safe_int(pr.get("accepted_tokens"), default=0))
-        proposed_tokens = max(0, _safe_int(pr.get("proposed_tokens"), default=0))
-        if proposed_tokens > 0:
-            summary["accepted_tokens_sum"] += accepted_tokens
-            summary["proposed_tokens_sum"] += proposed_tokens
+        tree_steps = max(0, _safe_int(pr.get("tree_steps"), default=0))
+        summary["accepted_tokens_sum"] += accepted_tokens
+        summary["tree_steps_sum"] += tree_steps
 
         wall_time = _safe_float(pr.get("wall_time"), default=-1.0)
         if wall_time >= 0.0:
@@ -298,12 +297,12 @@ def main() -> None:
         summary["exec_accuracy"] = summary["ex_matches"] / summary["ex_denominator"]
     if summary["db_found"] > 0:
         summary["pred_executable_rate"] = summary["pred_exec_ok"] / summary["db_found"]
-    if summary["acceptance_samples"] > 0:
-        summary["acceptance_rate_mean"] = acceptance_rate_sum / summary["acceptance_samples"]
-    if summary["proposed_tokens_sum"] > 0:
-        summary["acceptance_rate_token_weighted"] = (
-            summary["accepted_tokens_sum"] / summary["proposed_tokens_sum"]
-        )
+    if summary["tau_samples"] > 0:
+        summary["tau_mean"] = tau_sum / summary["tau_samples"]
+    if summary["tree_steps_sum"] > 0:
+        summary["tau_global"] = summary["accepted_tokens_sum"] / summary["tree_steps_sum"]
+    else:
+        summary["tau_global"] = 0.0
     if summary["wall_time_samples"] > 0:
         summary["wall_time_avg_sec"] = wall_time_sum / summary["wall_time_samples"]
 
@@ -334,14 +333,11 @@ def main() -> None:
         f.write(f"- EX matches: {summary['ex_matches']}\n")
         f.write(f"- Execution Accuracy (EX): {summary['exec_accuracy']:.4f}\n")
         f.write(f"- Pred executable rate: {summary['pred_executable_rate']:.4f}\n")
-        f.write(f"- Acceptance rate (sample mean): {summary['acceptance_rate_mean']:.4f}\n")
+        f.write(f"- Avg acceptance length τ (sample mean): {summary['tau_mean']:.2f}\n")
+        f.write(f"- Avg acceptance length τ (global): {summary['tau_global']:.2f}\n")
         f.write(
-            f"- Acceptance rate (token-weighted): "
-            f"{summary['acceptance_rate_token_weighted']:.4f}\n"
-        )
-        f.write(
-            f"- Accepted / Proposed tokens: "
-            f"{summary['accepted_tokens_sum']} / {summary['proposed_tokens_sum']}\n"
+            f"- Accepted / Tree-steps: "
+            f"{summary['accepted_tokens_sum']} / {summary['tree_steps_sum']}\n"
         )
         f.write(f"- Avg wall time per sample (sec): {summary['wall_time_avg_sec']:.4f}\n")
 
@@ -363,10 +359,10 @@ def main() -> None:
     print(json.dumps({
         "exec_accuracy": summary["exec_accuracy"],
         "pred_executable_rate": summary["pred_executable_rate"],
-        "acceptance_rate_mean": summary["acceptance_rate_mean"],
-        "acceptance_rate_token_weighted": summary["acceptance_rate_token_weighted"],
+        "tau_mean": summary["tau_mean"],
+        "tau_global": summary["tau_global"],
         "accepted_tokens_sum": summary["accepted_tokens_sum"],
-        "proposed_tokens_sum": summary["proposed_tokens_sum"],
+        "tree_steps_sum": summary["tree_steps_sum"],
         "wall_time_avg_sec": summary["wall_time_avg_sec"],
         "ex_matches": summary["ex_matches"],
         "ex_denominator": summary["ex_denominator"],

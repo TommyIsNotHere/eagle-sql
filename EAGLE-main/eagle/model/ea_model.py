@@ -211,7 +211,8 @@ class EaModel(nn.Module):
         # Quick health checks for draft vocab mapping. If these look degenerate,
         # generation often collapses to repeated punctuation/special tokens.
         strict_draft_map = os.environ.get("EAGLE_STRICT_DRAFT_MAP", "1") == "1"
-        if self.config.vocab_size != self.ea_layer.config.draft_vocab_size:
+        ea_draft_vocab = getattr(self.ea_layer.config, 'draft_vocab_size', self.config.vocab_size)
+        if self.config.vocab_size != ea_draft_vocab:
             issues = []
             selected = None
             d2t_nonzero = None
@@ -296,8 +297,11 @@ class EaModel(nn.Module):
             use_eagle3=True,
             base_model_path=None,
             ea_model_path=None,
-            total_token=60,
-            depth=7,
+            # Tree config: EAGLE-2 paper Appendix A recommends total_token=50,
+            # depth=6, top_k=10 for 13B class models (also reasonable for 14B).
+            # Pass total_token=-1 to enable runtime auto-tune (see lines below).
+            total_token=50,
+            depth=6,
             top_k=10,
             threshold=1.0,
             **kwargs,
@@ -487,11 +491,16 @@ class EaModel(nn.Module):
             )
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
+            # Count UNIQUE proposed tokens in the tree (before padding is appended).
+            # Earlier we counted entries across retrieve_indices paths, which
+            # double-counts tokens shared by multiple branches and grossly
+            # inflates the denominator of acceptance_rate. The tree actually
+            # costs base-model one forward over draft_tokens.shape[1]-1 unique
+            # candidates (excluding the alignment anchor at position 0).
+            unique_tree_proposed = int(draft_tokens.shape[1] - 1)
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
             candidates = draft_tokens[0, retrieve_indices]
-            # Number of draft tokens proposed in this tree step (exclude the first
-            # position used as alignment anchor; ignore padding=-1 entries).
-            proposed_tokens += int((candidates[:, 1:] != -1).sum().item())
+            proposed_tokens += unique_tree_proposed
             # verification
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
@@ -528,11 +537,13 @@ class EaModel(nn.Module):
             return input_ids
         else:
             if return_stats:
+                tree_steps = int(idx + 1) if idx >= 0 else 0
                 stats = {
                     "accepted_tokens": int(accepted_tokens),
                     "proposed_tokens": int(proposed_tokens),
                     "acceptance_rate": float(accepted_tokens / proposed_tokens) if proposed_tokens > 0 else 0.0,
-                    "tree_steps": int(idx + 1) if idx >= 0 else 0,
+                    "mean_accepted_length": float(accepted_tokens / tree_steps) if tree_steps > 0 else 0.0,
+                    "tree_steps": tree_steps,
                 }
                 return input_ids, new_token, idx, stats
             return input_ids, new_token, idx

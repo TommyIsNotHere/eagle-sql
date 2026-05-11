@@ -127,7 +127,7 @@ def _summarize_group(label: str, raw_path: str) -> dict[str, Any]:
     probe_nan_sum = 0
     probe_inf_sum = 0
     top1_ratio_values: list[float] = []
-    acceptance_values: list[float] = []
+    tau_values: list[float] = []
     wall_time_values: list[float] = []
     tree_mask_before_probe_values: list[int] = []
     tree_mask_before_gen_values: list[int] = []
@@ -160,7 +160,9 @@ def _summarize_group(label: str, raw_path: str) -> dict[str, Any]:
         except Exception:
             pass
         try:
-            acceptance_values.append(float(r.get("acceptance_rate", 0.0)))
+            v = float(r.get("mean_accepted_length", 0.0))
+            if v > 0:
+                tau_values.append(v)
         except Exception:
             pass
         try:
@@ -255,7 +257,7 @@ def _summarize_group(label: str, raw_path: str) -> dict[str, Any]:
         "probe_inf_sum": probe_inf_sum,
         "probe_entropy_min": min(probe_entropy_values) if probe_entropy_values else math.nan,
         "avg_gen_top1_ratio": statistics.mean(top1_ratio_values) if top1_ratio_values else math.nan,
-        "avg_acceptance_rate": statistics.mean(acceptance_values) if acceptance_values else math.nan,
+        "avg_tau": statistics.mean(tau_values) if tau_values else math.nan,
         "avg_wall_time_sec": statistics.mean(wall_time_values) if wall_time_values else math.nan,
         "state_before_probe_tree_mask_active_rate": (
             _safe_ratio(sum(tree_mask_before_probe_values), len(tree_mask_before_probe_values))

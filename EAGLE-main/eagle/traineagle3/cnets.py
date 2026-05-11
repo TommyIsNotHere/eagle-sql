@@ -781,10 +781,11 @@ class Model(nn.Module):
 
     def _count_tokens_from_tokenized_dataset(self, tokenized_dataset, rank: int):
         token_counts = torch.zeros(self.vocab_size, dtype=torch.long)
-        total_rows = len(tokenized_dataset) if hasattr(tokenized_dataset, "__len__") else None
+        total_rows = len(tokenized_dataset)
         t0 = time.time()
+        next_pct = 25
 
-        for idx in range(len(tokenized_dataset)):
+        for idx in range(total_rows):
             sample = tokenized_dataset[idx]
             ids = sample["input_ids"]
             mask = sample["loss_mask"]
@@ -806,16 +807,12 @@ class Model(nn.Module):
                 selected = ids[mask]
                 token_counts += torch.bincount(selected, minlength=self.vocab_size)
 
-            if (idx + 1) % 5000 == 0:
-                if total_rows is not None:
-                    print(
-                        f"[scandata][rank {rank}] token count progress: "
-                        f"{idx + 1}/{total_rows} ({(idx + 1) / max(1, total_rows):.1%})"
-                    )
-                else:
-                    print(f"[scandata][rank {rank}] token count progress: {idx + 1} rows")
+            pct = int((idx + 1) / max(1, total_rows) * 100)
+            if pct >= next_pct:
+                print(f"[scandata][rank {rank}] token count {pct}% ({idx + 1}/{total_rows})")
+                next_pct = pct + 25
 
-        print(f"[scandata][rank {rank}] token counting done in {time.time() - t0:.1f}s")
+        print(f"[scandata][rank {rank}] token counting done rows={total_rows} in {time.time() - t0:.1f}s")
         return token_counts
 
     def _build_cache_from_counts(self, token_counts: torch.Tensor, N: int, rank: int):
@@ -1067,42 +1064,11 @@ class Model(nn.Module):
                 return None
             return None
 
-        # Fast path: reuse already-tokenized training set to avoid re-tokenizing
-        # the full corpus under file lock in distributed launches.
-        if tokenized_dataset is not None:
-            if os.path.exists(cache_path):
-                print(f"[scandata][rank {rank}] loading cache: {cache_path}")
-                cache = torch.load(cache_path)
-                d2t = cache["d2t"]
-                t2d = cache["t2d"]
-            else:
-                print(
-                    f"[scandata][rank {rank}] building cache from in-memory tokenized dataset "
-                    f"(rows={len(tokenized_dataset)}, vocab={self.vocab_size}, draft_vocab={N})"
-                )
-                token_counts = self._count_tokens_from_tokenized_dataset(tokenized_dataset, rank)
-                d2t, t2d = self._build_cache_from_counts(token_counts, N, rank)
-                if rank == 0:
-                    try:
-                        torch.save({"d2t": d2t, "t2d": t2d}, cache_path)
-                        print(f"[scandata][rank {rank}] cache saved: {cache_path}")
-                    except Exception as e:
-                        print(f"[scandata][rank {rank}] WARN: failed to save cache: {e}")
-
-            t2d_index = self._build_t2d_index(t2d)
-            draft_to_token = torch.arange(d2t.numel(), dtype=torch.long) + d2t.long()
-            self._estimate_in_draft_ratio(tokenized_dataset, t2d, rank)
-            self.register_buffer("d2t", d2t)
-            self.register_buffer("t2d", t2d)
-            self.register_buffer("t2d_index", t2d_index)
-            self.register_buffer("draft_to_token", draft_to_token)
-            self.l1smooth = nn.SmoothL1Loss(reduction="none")
-            return
+        lock_fd = None
 
         # In distributed launches, multiple ranks may enter here concurrently.
         # Use a lock file so only one rank builds cache while others wait and reuse it.
         if not os.path.exists(cache_path):
-            lock_fd = None
             waited = 0
             while True:
                 try:
@@ -1162,87 +1128,96 @@ class Model(nn.Module):
 
         if not os.path.exists(cache_path):
             try:
-                t0 = time.time()
-                tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
-                dataset = load_dataset('json', data_files=datapath)
-                dataset = dataset['train']
-                # dataset = dataset.select(range(96))
-                original_columns1 = dataset.column_names
-                num_proc = max(1, min(self.preprocess_num_proc, max(1, os.cpu_count() or 1)))
-                print(f"[scandata] building cache at {cache_path}, num_proc={num_proc}, rows={len(dataset)}")
+                if tokenized_dataset is not None:
+                    print(
+                        f"[scandata][rank {rank}] building cache from tokenized dataset "
+                        f"(rows={len(tokenized_dataset)}, vocab={self.vocab_size}, draft_vocab={N})"
+                    )
+                    token_counts = self._count_tokens_from_tokenized_dataset(tokenized_dataset, rank)
+                    d2t, t2d = self._build_cache_from_counts(token_counts, N, rank)
+                    torch.save({"d2t": d2t, "t2d": t2d}, cache_path)
+                    print(f"[scandata][rank {rank}] cache saved: {cache_path}")
+                else:
+                    t0 = time.time()
+                    tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
+                    dataset = load_dataset('json', data_files=datapath)
+                    dataset = dataset['train']
+                    original_columns1 = dataset.column_names
+                    num_proc = max(1, min(self.preprocess_num_proc, max(1, os.cpu_count() or 1)))
+                    print(f"[scandata] building cache at {cache_path}, num_proc={num_proc}, rows={len(dataset)}")
 
+                    def preprocess_function(examples):
+                        new_examples = {
+                            "input_ids": [],
+                            "loss_mask": []
+                        }
+                        conversations = examples.get("conversations") or []
+                        for source in conversations:
+                            sample = build_tokenized_sample(
+                                tokenizer=tokenizer,
+                                source=source,
+                                max_len=self.max_len,
+                            )
+                            if sample is None:
+                                continue
+                            new_examples["input_ids"].append(sample["input_ids"])
+                            new_examples["loss_mask"].append(sample["loss_mask"])
+                        return new_examples
 
-                def preprocess_function(examples):
-                    new_examples = {
-                        # "conversation": [],
-                        "input_ids": [],
-                        "loss_mask": []
+                    dataset = dataset.map(
+                        preprocess_function,
+                        batched=True,
+                        num_proc=num_proc,
+                        remove_columns=original_columns1,
+                        load_from_cache_file=False
+                    )
+                    print(f"[scandata][rank {rank}] dataset.map done in {time.time() - t0:.1f}s")
+
+                    # Avoid another large multiprocessing fanout here (can trigger OOM kill in multi-rank runs).
+                    t1 = time.time()
+                    token_dict = Counter()
+                    for i in range(len(dataset)):
+                        ids = dataset[i]["input_ids"][0]
+                        mask = dataset[i]["loss_mask"][0]
+                        for j in range(len(ids)):
+                            if mask[j] == 1:
+                                token_dict[ids[j]] += 1
+                    print(f"[scandata][rank {rank}] token counting done in {time.time() - t1:.1f}s")
+
+                    total_frequency = sum(token_dict.values())
+                    top_N = token_dict.most_common(N)
+                    top_N_frequency_sum = sum(freq for key, freq in top_N)
+                    top_N_ratio = top_N_frequency_sum / total_frequency
+                    print(f"top {N} token frequency ratio: {top_N_ratio:.2%}")
+                    used_tokens = [key for key, freq in top_N]
+                    used_tokens.sort()
+                    d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
+                    t2d = [i in used_tokens for i in range(self.vocab_size)]
+                    d2t = torch.tensor(d2t)
+                    t2d = torch.tensor(t2d)
+                    cache = {
+                        "d2t": d2t,
+                        "t2d": t2d
                     }
-                    for i in range(len(examples['id'])):
-                        source = examples['conversations'][i]
-                        sample = build_tokenized_sample(
-                            tokenizer=tokenizer,
-                            source=source,
-                            max_len=self.max_len,
-                        )
-                        if sample is None:
-                            continue
-                        new_examples["input_ids"].append(sample["input_ids"])
-                        new_examples["loss_mask"].append(sample["loss_mask"])
-
-                    return new_examples
-
-                dataset = dataset.map(
-                    preprocess_function,
-                    batched=True,
-                    num_proc=num_proc,
-                    remove_columns=original_columns1,
-                    load_from_cache_file=False
-                )
-                print(f"[scandata][rank {rank}] dataset.map done in {time.time() - t0:.1f}s")
-                #dataset.set_format(type="torch")
-
-                # Avoid another large multiprocessing fanout here (can trigger OOM kill in multi-rank runs).
-                t1 = time.time()
-                token_dict = Counter()
-                for i in range(len(dataset)):
-                    ids = dataset[i]["input_ids"][0]
-                    mask = dataset[i]["loss_mask"][0]
-                    for j in range(len(ids)):
-                        if mask[j] == 1:
-                            token_dict[ids[j]] += 1
-                print(f"[scandata][rank {rank}] token counting done in {time.time() - t1:.1f}s")
-
-
-                total_frequency = sum(token_dict.values())
-                top_N = token_dict.most_common(N)
-                top_N_frequency_sum = sum(freq for key, freq in top_N)
-                top_N_ratio = top_N_frequency_sum / total_frequency
-                print(f"top {N} token frequency ratio: {top_N_ratio:.2%}")
-                used_tokens = [key for key, freq in top_N]
-                used_tokens.sort()
-                d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
-                t2d = [i in used_tokens for i in range(self.vocab_size)]
-                d2t = torch.tensor(d2t)
-                t2d = torch.tensor(t2d)
-                cache = {
-                    "d2t": d2t,
-                    "t2d": t2d
-                }
-                torch.save(cache, cache_path)
-                print(f"[scandata][rank {rank}] cache saved: {cache_path}")
+                    torch.save(cache, cache_path)
+                    print(f"[scandata][rank {rank}] cache saved: {cache_path}")
             finally:
-                if 'lock_fd' in locals() and lock_fd is not None:
+                if lock_fd is not None:
                     os.close(lock_fd)
                 if os.path.exists(lock_path):
                     os.remove(lock_path)
-        else:
-            print(f"[scandata][rank {rank}] loading cache: {cache_path}")
-            cache = torch.load(cache_path)
-            d2t = cache["d2t"]
-            t2d = cache["t2d"]
+
+        if not os.path.exists(cache_path):
+            raise RuntimeError(f"scandata cache missing after build/wait: {cache_path}")
+
+        print(f"[scandata][rank {rank}] loading cache: {cache_path}")
+        cache = torch.load(cache_path)
+        d2t = cache["d2t"]
+        t2d = cache["t2d"]
         t2d_index = self._build_t2d_index(t2d)
         draft_to_token = torch.arange(d2t.numel(), dtype=torch.long) + d2t.long()
+        if tokenized_dataset is not None and rank == 0:
+            self._estimate_in_draft_ratio(tokenized_dataset, t2d, rank)
         self.register_buffer("d2t", d2t)
         self.register_buffer("t2d", t2d)
         self.register_buffer("t2d_index", t2d_index)

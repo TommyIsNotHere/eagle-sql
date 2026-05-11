@@ -14,49 +14,37 @@ export PYTHONPATH="${EAGLE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 PROJECT_ROOT="/mnt/nj-aigc/usr/wangtong2/eagle_sql"
 BASE_MODEL_PATH="${1:-${PROJECT_ROOT}/model/Qwen2.5-Coder-14B-Instruct}"
 EA_MODEL_PATH="${2:-${PROJECT_ROOT}/artifacts/eagle2/infer}"
-# prep_bird output schema: question_id/db_id/question/evidence/schema_context/database_description/gold_sql.
-# Run scripts/run_bird_eagle3_full_eval.sh to (re)generate it.
-QUESTION_FILE="${3:-${PROJECT_ROOT}/artifacts/bird_dev_full_eval/bird_dev_infer.jsonl}"
-ANSWER_FILE="${4:-${PROJECT_ROOT}/artifacts/pred_dev.jsonl}"
+ANSWER_FILE="${3:-${PROJECT_ROOT}/artifacts/eval_sharegpt/eval_sharegpt.jsonl}"
 
-MAX_NEW_TOKEN="${MAX_NEW_TOKEN:-128}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
 # Tree config follows EAGLE-2 paper Appendix A for 13B class models
 # (also a sane default for 14B). Set TOTAL_TOKEN=-1 to enable auto-tune.
 TOTAL_TOKEN="${TOTAL_TOKEN:-50}"
 DEPTH="${DEPTH:-6}"
 TOP_K="${TOP_K:-10}"
-DECODE_MODE="${DECODE_MODE:-eagle}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
-USE_EAGLE3="${USE_EAGLE3:-0}"
-# Stage A BIRD baseline: keep retry OFF to measure clean acceptance.
-RETRY_INVALID_SQL="${RETRY_INVALID_SQL:-0}"
+SEED="${SEED:-42}"
+MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-4096}"
+QUESTION_FILE="${QUESTION_FILE:-}"
 
 EXTRA_FLAGS=""
-if [[ "${USE_EAGLE3}" == "1" ]]; then
-  EXTRA_FLAGS="--use-eagle3"
-else
-  EXTRA_FLAGS="--use-eagle2"
-fi
-if [[ "${RETRY_INVALID_SQL}" == "1" ]]; then
-  EXTRA_FLAGS="${EXTRA_FLAGS} --retry-invalid-sql"
-else
-  EXTRA_FLAGS="${EXTRA_FLAGS} --no-retry-invalid-sql"
+if [[ -n "$QUESTION_FILE" ]]; then
+  EXTRA_FLAGS="--question-file $QUESTION_FILE"
 fi
 
 (
   cd "${EAGLE_DIR}"
-  python -m eagle.evaluation.gen_ea_answer_qwen3_bird \
+  python -m eagle.evaluation.eval_sharegpt \
     --base-model-path "$BASE_MODEL_PATH" \
     --ea-model-path "$EA_MODEL_PATH" \
-    --question-file "$QUESTION_FILE" \
     --answer-file "$ANSWER_FILE" \
-    --max-new-token "$MAX_NEW_TOKEN" \
+    --max-new-tokens "$MAX_NEW_TOKENS" \
     --total-token "$TOTAL_TOKEN" \
     --depth "$DEPTH" \
     --top-k "$TOP_K" \
-    --decode-mode "$DECODE_MODE" \
     --max-samples "$MAX_SAMPLES" \
-    --reset-kv-per-sample \
+    --seed "$SEED" \
+    --max-prompt-len "$MAX_PROMPT_LEN" \
     --warmup \
     --bf16 \
     ${EXTRA_FLAGS}

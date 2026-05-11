@@ -14,6 +14,7 @@ parser.add_argument('--testpath', type=str,
                     default="/home/lyh/code/nlp/developing/vllmbase/vllm/gedata/0318.json")
 parser.add_argument('--savedir', type=str, default='0')
 parser.add_argument('--num-epochs', type=int, default=40)
+parser.add_argument('--seed', type=int, default=42)
 parser.add_argument('--max-len', type=int, default=2048)
 parser.add_argument('--num-workers', type=int, default=2)
 parser.add_argument('--preprocess-num-proc', type=int, default=8)
@@ -41,6 +42,9 @@ parser.add_argument(
     default=os.environ.get("EAGLE_TRAIN_SYSTEM_PROMPT", "auto"),
     help="System prompt mode for tokenization: auto|bird|sql|generic or a literal custom prompt",
 )
+parser.add_argument('--train-tokenized-path', type=str, default="")
+parser.add_argument('--test-tokenized-path', type=str, default="")
+parser.add_argument('--tokenized-load-strict', type=int, default=0)
 parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
@@ -91,13 +95,12 @@ from accelerate.utils import set_seed
 set_seed(0)
 from cnets import Model
 from configs import EConfig
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
-from tqdm import tqdm
 # import accelerate
 import numpy as np
 from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmup
@@ -106,12 +109,12 @@ from data_utils import build_tokenized_sample, resolve_system_prompt
 
 
 def build_dataset_rank(
-        tokenizer, datapath, system_prompt
+        tokenizer, datapath, system_prompt, shuffle_seed
 ):
 
     ds = load_dataset('json', data_files=datapath)
     ds = ds['train']
-    ds = ds.shuffle(seed=42)
+    ds = ds.shuffle(seed=int(shuffle_seed))
     ds1 = ds
     original_columns1 = ds1.column_names
     num_proc = max(1, int(train_config["preprocess_num_proc"]))
@@ -122,8 +125,8 @@ def build_dataset_rank(
             "input_ids": [],
             "loss_mask": []
         }
-        for i in range(len(examples['id'])):
-            source = examples['conversations'][i]
+        conversations = examples.get("conversations") or []
+        for source in conversations:
             sample = build_tokenized_sample(
                 tokenizer=tokenizer,
                 source=source,
@@ -149,6 +152,24 @@ def build_dataset_rank(
 
     ds1.set_format(type="torch")
     return ds1
+
+
+def load_tokenized_dataset(tokenized_path: str):
+    path = (tokenized_path or "").strip()
+    if not path:
+        return None
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"tokenized dataset dir not found: {path}")
+    dataset = load_from_disk(path)
+    required_cols = {"input_ids", "attention_mask", "loss_mask"}
+    missing = [c for c in required_cols if c not in set(dataset.column_names)]
+    if missing:
+        raise RuntimeError(
+            f"tokenized dataset missing required columns at {path}: {missing}, "
+            f"columns={dataset.column_names}"
+        )
+    dataset.set_format(type="torch")
+    return dataset
 
 
 class DataCollatorWithPadding:
@@ -196,8 +217,59 @@ print(
     f"chars={len(train_system_prompt)} "
     f"preview={train_system_prompt[:120].replace(chr(10), ' ')}"
 )
-traindataset = build_dataset_rank(tokenizer, args.trainpath, train_system_prompt)
-testdataset = build_dataset_rank(tokenizer, args.testpath, train_system_prompt)
+train_tokenized_path = (args.train_tokenized_path or "").strip()
+test_tokenized_path = (args.test_tokenized_path or "").strip()
+tokenized_load_strict = int(args.tokenized_load_strict) == 1
+train_dataset_source = "online"
+test_dataset_source = "online"
+
+_is_rank0 = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0
+
+if train_tokenized_path:
+    try:
+        _stage_t0 = time.time()
+        traindataset = load_tokenized_dataset(train_tokenized_path)
+        train_dataset_source = f"offline:{train_tokenized_path}"
+        if _is_rank0:
+            print(
+                f"[dataset] loaded train tokenized rows={len(traindataset)} "
+                f"in {time.time() - _stage_t0:.1f}s from {train_tokenized_path}"
+            )
+    except Exception as e:
+        if tokenized_load_strict:
+            raise
+        if _is_rank0:
+            print(f"WARN: train tokenized load failed, fallback to online. err={repr(e)}")
+        traindataset = build_dataset_rank(tokenizer, args.trainpath, train_system_prompt, args.seed)
+else:
+    traindataset = build_dataset_rank(tokenizer, args.trainpath, train_system_prompt, args.seed)
+
+if test_tokenized_path:
+    try:
+        _stage_t0 = time.time()
+        testdataset = load_tokenized_dataset(test_tokenized_path)
+        test_dataset_source = f"offline:{test_tokenized_path}"
+        if _is_rank0:
+            print(
+                f"[dataset] loaded eval tokenized rows={len(testdataset)} "
+                f"in {time.time() - _stage_t0:.1f}s from {test_tokenized_path}"
+            )
+    except Exception as e:
+        if tokenized_load_strict:
+            raise
+        if _is_rank0:
+            print(f"WARN: eval tokenized load failed, fallback to online. err={repr(e)}")
+        testdataset = build_dataset_rank(tokenizer, args.testpath, train_system_prompt, args.seed)
+else:
+    testdataset = build_dataset_rank(tokenizer, args.testpath, train_system_prompt, args.seed)
+
+train_dataset_fingerprint = str(getattr(traindataset, "_fingerprint", "unknown"))
+test_dataset_fingerprint = str(getattr(testdataset, "_fingerprint", "unknown"))
+if _is_rank0:
+    print(
+        f"[dataset] train={train_dataset_source} rows={len(traindataset)} fp={train_dataset_fingerprint}; "
+        f"eval={test_dataset_source} rows={len(testdataset)} fp={test_dataset_fingerprint}"
+    )
 
 world_size_env = max(1, int(os.environ.get("WORLD_SIZE", "1")))
 global_batch = (
@@ -268,8 +340,12 @@ model.scandata(
         "max_len": int(train_config["max_len"]),
         "system_prompt_mode": str(args.system_prompt),
         "system_prompt_text": train_system_prompt,
+        "dataset_shuffle_seed": int(args.seed),
         "draft_vocab_size": int(config.draft_vocab_size),
         "teacher_hidden_selector": os.environ.get("EAGLE_TEACHER_HIDDEN_SELECTOR", "paper"),
+        "train_dataset_source": train_dataset_source,
+        "train_dataset_fingerprint": train_dataset_fingerprint,
+        "train_dataset_len": len(traindataset),
     },
 )
 print(f"[stage] model.scandata() done in {time.time() - _stage_t0:.1f}s")
@@ -451,66 +527,106 @@ def maybe_dump_stall_diag(tag: str, epoch: int, batch_idx: int, wait_s: float):
     dmesg_tail = _run_cmd_for_diag(["bash", "-lc", "dmesg -T | tail -n 30"])
     rank_log("STALL-DIAG dmesg-tail:\n" + dmesg_tail, force_all_ranks=True)
 
+
+def all_reduce_scalar_int(value: int, op, dtype=torch.int64):
+    tensor = torch.tensor(int(value), dtype=dtype, device=device)
+    t0 = time.perf_counter()
+    deepspeed.comm.all_reduce(tensor, op=op)
+    return int(tensor.item()), time.perf_counter() - t0
+
+
+def distributed_sanity_check():
+    checks = {
+        "world_size": world_size,
+        "train_dataset_len": len(traindataset),
+        "eval_dataset_len": len(testdataset),
+        "train_sampler_len": len(train_sampler),
+        "eval_sampler_len": len(sampler),
+        "train_loader_len": len(train_loader),
+        "eval_loader_len": len(test_loader),
+        "start_epoch": start_epoch,
+        "micro_batch_size": train_config["bs"],
+        "num_epochs": num_epochs,
+        "num_workers": train_config["num_workers"],
+        "persistent_workers": int(train_config["persistent_workers"]),
+        "prefetch_factor": int(train_config["prefetch_factor"]),
+        "dataloader_timeout_ms": int(train_config["dataloader_timeout"] * 1000),
+        "max_train_steps": max_train_steps,
+        "max_eval_steps": max_eval_steps,
+        "global_stall_seconds_ms": int(global_stall_seconds * 1000),
+        "draft_vocab_size": int(config.draft_vocab_size),
+    }
+
+    mismatch_msgs = []
+    summary = []
+    for name, local_val in checks.items():
+        min_v, _ = all_reduce_scalar_int(local_val, deepspeed.comm.ReduceOp.MIN)
+        max_v, _ = all_reduce_scalar_int(local_val, deepspeed.comm.ReduceOp.MAX)
+        summary.append(f"{name}={local_val}")
+        if min_v != max_v:
+            mismatch_msgs.append(f"{name}: min={min_v}, max={max_v}, local={local_val}")
+
+    if mismatch_msgs:
+        msg = "distributed sanity check failed: " + "; ".join(mismatch_msgs)
+        rank_log("ERROR " + msg, force_all_ranks=True)
+        raise RuntimeError(msg)
+
+    if global_rank == 0:
+        rank_log("dist-sanity OK " + ", ".join(summary))
+
+
 if global_rank == 0:
     rank_log(
-        "runtime-debug-config "
-        f"num_workers={train_config['num_workers']} pin_memory={int(train_config['pin_memory'])} "
-        f"persistent_workers={int(train_config['persistent_workers'])} "
-        f"prefetch_factor={train_config['prefetch_factor']} "
-        f"dataloader_in_order={int(train_config['dataloader_in_order'])} "
-        f"dataloader_timeout={train_config['dataloader_timeout']} "
-        f"heartbeat_steps={heartbeat_steps} slow_stage_seconds={slow_stage_seconds} "
-        f"empty_cache_every_steps={empty_cache_every_steps} "
-        f"cuda_sync_heartbeat_steps={cuda_sync_heartbeat_steps} "
-        f"max_train_steps={max_train_steps} max_eval_steps={max_eval_steps} "
-        f"global_stall_seconds={global_stall_seconds} "
-        f"abort_on_global_stall={int(abort_on_global_stall)} "
-        f"stall_diagnostics={int(stall_diagnostics)} "
-        f"stall_diag_cooldown={stall_diagnostics_cooldown}"
+        f"runtime heartbeat={heartbeat_steps} slow_stage={slow_stage_seconds}s "
+        f"stall_guard={global_stall_seconds}s workers={train_config['num_workers']} "
+        f"max_train={max_train_steps} max_eval={max_eval_steps}"
     )
+
+if os.environ.get("EAGLE_DIST_SANITY_CHECK", "1") == "1":
+    distributed_sanity_check()
+
+deepspeed.comm.barrier()
 
 for epoch in range(start_epoch, num_epochs):
     train_sampler.set_epoch(epoch + 1)
-    print(f"Now training epoch {epoch}")
+    if global_rank == 0:
+        rank_log(f"epoch {epoch}/{num_epochs} train start")
 
     model.train()
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
     skipped_train_batches = 0
     processed_train_batches = 0
+    epoch_t0 = time.perf_counter()
     prev_train_loop_end = time.perf_counter()
 
-    for batch_idx, data in enumerate(tqdm(train_loader)):
+    for batch_idx, data in enumerate(train_loader):
         if max_train_steps > 0 and batch_idx >= max_train_steps:
             if global_rank == 0:
-                rank_log(f"Reached max_train_steps={max_train_steps}; stop epoch early for diagnostics.")
+                rank_log(f"max_train_steps={max_train_steps} reached, stopping epoch early")
             break
 
         processed_train_batches += 1
         batch_begin = time.perf_counter()
         data_wait_sec = batch_begin - prev_train_loop_end
+
         if data_wait_sec > slow_stage_seconds:
             rank_log(
-                f"SLOW stage=dataloader_wait epoch={epoch} batch={batch_idx} wait={data_wait_sec:.3f}s",
+                f"SLOW dataloader_wait epoch={epoch} batch={batch_idx} wait={data_wait_sec:.1f}s",
                 force_all_ranks=True,
             )
             maybe_dump_stall_diag("train_dataloader_wait", epoch, batch_idx, data_wait_sec)
-            if global_stall_seconds > 0 and data_wait_sec >= global_stall_seconds:
-                global_stall_flag = torch.tensor(1, dtype=torch.int32, device=device)
-                deepspeed.comm.all_reduce(global_stall_flag, op=deepspeed.comm.ReduceOp.MIN)
-                if global_stall_flag.item() == 1:
-                    msg = (
-                        "suspected global process pause/preemption: "
-                        f"all ranks saw dataloader_wait >= {global_stall_seconds}s "
-                        f"(epoch={epoch}, batch={batch_idx}, wait={data_wait_sec:.3f}s)"
-                    )
-                    rank_log("ERROR " + msg, force_all_ranks=True)
-                    if abort_on_global_stall:
-                        raise RuntimeError(msg)
 
-        stage_t0 = time.perf_counter()
+        if global_stall_seconds > 0 and data_wait_sec >= global_stall_seconds:
+            msg = (
+                f"dataloader stall: wait={data_wait_sec:.1f}s >= {global_stall_seconds}s "
+                f"(epoch={epoch}, batch={batch_idx})"
+            )
+            rank_log("ERROR " + msg, force_all_ranks=True)
+            if abort_on_global_stall:
+                raise RuntimeError(msg)
+
         model_engine.zero_grad()
-        zero_grad_sec = time.perf_counter() - stage_t0
 
         stage_t0 = time.perf_counter()
         input_ids = data["input_ids"].to(device, non_blocking=True)
@@ -528,8 +644,7 @@ for epoch in range(start_epoch, num_epochs):
             forward_sec = time.perf_counter() - stage_t0
         except Exception as e:
             rank_log(
-                f"ERROR stage=forward epoch={epoch} batch={batch_idx} "
-                f"wait={data_wait_sec:.3f}s h2d={h2d_sec:.3f}s err={repr(e)}",
+                f"ERROR forward epoch={epoch} batch={batch_idx} err={repr(e)}",
                 force_all_ranks=True,
             )
             raise
@@ -539,29 +654,24 @@ for epoch in range(start_epoch, num_epochs):
             dtype=torch.int32,
             device=device,
         )
-        stage_t0 = time.perf_counter()
         deepspeed.comm.all_reduce(model_nonfinite_flag, op=deepspeed.comm.ReduceOp.MAX)
-        allreduce_nonfinite_sec = time.perf_counter() - stage_t0
         if model_nonfinite_flag.item() > 0:
             stage = getattr(model_engine.module, "_nonfinite_stage_this_step", "unknown")
-            if global_rank == 0:
-                print(
-                    f"ERROR: non-finite tensor detected in model forward "
-                    f"(epoch={epoch}, batch={batch_idx}, first_stage={stage})."
-                )
+            rank_log(
+                f"ERROR non-finite in forward epoch={epoch} batch={batch_idx} stage={stage}",
+                force_all_ranks=True,
+            )
             if os.environ.get("EAGLE_FAIL_FAST_ON_MODEL_NONFINITE", "1") == "1":
                 raise RuntimeError(
-                    "non-finite tensor detected in model forward; aborting early to avoid NCCL timeout."
+                    f"non-finite tensor in forward (epoch={epoch}, batch={batch_idx}, stage={stage})"
                 )
 
         ploss_tensor = torch.stack([p.float() for p in plosses])
         bad_flag = (~torch.isfinite(ploss_tensor)).any().to(dtype=torch.int32)
-        stage_t0 = time.perf_counter()
         deepspeed.comm.all_reduce(bad_flag, op=deepspeed.comm.ReduceOp.MAX)
-        allreduce_badflag_sec = time.perf_counter() - stage_t0
         if bad_flag.item() > 0:
             if global_rank == 0:
-                print(f"WARN: non-finite ploss detected at epoch={epoch}, batch={batch_idx}; skip this batch")
+                rank_log(f"WARN non-finite ploss epoch={epoch} batch={batch_idx}, skip")
             model_engine.zero_grad()
             skipped_train_batches += 1
             prev_train_loop_end = time.perf_counter()
@@ -586,42 +696,23 @@ for epoch in range(start_epoch, num_epochs):
             sync_sec = time.perf_counter() - stage_t0
             if sync_sec > slow_stage_seconds:
                 rank_log(
-                    f"SLOW stage=cuda_sync epoch={epoch} batch={batch_idx} sync={sync_sec:.3f}s",
+                    f"SLOW cuda_sync epoch={epoch} batch={batch_idx} sync={sync_sec:.1f}s",
                     force_all_ranks=True,
                 )
 
         if empty_cache_every_steps > 0 and ((batch_idx + 1) % empty_cache_every_steps == 0):
             torch.cuda.empty_cache()
 
-        if (
-            h2d_sec > slow_stage_seconds
-            or forward_sec > slow_stage_seconds
-            or allreduce_nonfinite_sec > slow_stage_seconds
-            or allreduce_badflag_sec > slow_stage_seconds
-            or backward_sec > slow_stage_seconds
-            or step_sec > slow_stage_seconds
-        ):
-            rank_log(
-                f"SLOW epoch={epoch} batch={batch_idx} wait={data_wait_sec:.3f}s zero={zero_grad_sec:.3f}s "
-                f"h2d={h2d_sec:.3f}s fwd={forward_sec:.3f}s "
-                f"ar_nonfinite={allreduce_nonfinite_sec:.3f}s ar_bad={allreduce_badflag_sec:.3f}s "
-                f"bwd={backward_sec:.3f}s step={step_sec:.3f}s iter={iter_total_sec:.3f}s",
-                force_all_ranks=True,
-            )
-
         if batch_idx % heartbeat_steps == 0:
-            mem_alloc_mb = 0.0
-            mem_reserved_mb = 0.0
-            if torch.cuda.is_available():
-                mem_alloc_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
-                mem_reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
             lr = optimizer.optimizer.param_groups[0]["lr"]
+            slow_tag = ""
+            if any(t > slow_stage_seconds for t in [h2d_sec, forward_sec, backward_sec, step_sec]):
+                slow_tag = " [SLOW]"
             rank_log(
                 f"HB epoch={epoch} batch={batch_idx}/{len(train_loader)} "
-                f"wait={data_wait_sec:.3f}s h2d={h2d_sec:.3f}s fwd={forward_sec:.3f}s "
-                f"ar_nonfinite={allreduce_nonfinite_sec:.3f}s ar_bad={allreduce_badflag_sec:.3f}s "
-                f"bwd={backward_sec:.3f}s step={step_sec:.3f}s iter={iter_total_sec:.3f}s "
-                f"lr={lr:.8f} mem_alloc={mem_alloc_mb:.1f}MB mem_reserved={mem_reserved_mb:.1f}MB"
+                f"loss={float(loss.item()):.4f} acc0={acces[0]:.4f} lr={lr:.2e} "
+                f"iter={iter_total_sec:.2f}s wait={data_wait_sec:.2f}s"
+                f"{slow_tag}"
             )
 
         prev_train_loop_end = time.perf_counter()
@@ -636,13 +727,15 @@ for epoch in range(start_epoch, num_epochs):
         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
         epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
+    epoch_elapsed = time.perf_counter() - epoch_t0
     if global_rank == 0 and skipped_train_batches > 0:
-        print(f"WARN: skipped_train_batches={skipped_train_batches}/{processed_train_batches}")
+        rank_log(f"WARN skipped_train_batches={skipped_train_batches}/{processed_train_batches}")
     if processed_train_batches == 0:
         raise RuntimeError("No training batches were processed in this epoch; training is invalid.")
     if skipped_train_batches >= processed_train_batches:
         raise RuntimeError("All training batches were skipped due non-finite losses; training is invalid.")
 
+    train_acc_summary = []
     for i in range(len(epoch_acces)):
         if len(epoch_acces[i]) == 0:
             acc_i = torch.tensor(0.0, device=device)
@@ -652,11 +745,11 @@ for epoch in range(start_epoch, num_epochs):
             acc_i = acc_vals.mean()
         deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
         acc_i = acc_i.item()
-        if global_rank == 0:
-            if wandb is not None:
-                wandb.log({f"train/epochacc_{i}": acc_i})
-            print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.4f}")
+        train_acc_summary.append(f"p{i}={acc_i:.4f}")
+        if global_rank == 0 and wandb is not None:
+            wandb.log({f"train/epochacc_{i}": acc_i})
 
+    train_loss_summary = []
     for i in range(len(epoch_plosses)):
         if len(epoch_plosses[i]) == 0:
             loss_i = torch.tensor(0.0, device=device)
@@ -666,50 +759,51 @@ for epoch in range(start_epoch, num_epochs):
             loss_i = loss_vals.mean()
         deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
         loss_i = loss_i.item()
-        if global_rank == 0:
-            if wandb is not None:
-                wandb.log({f"train/epochploss_{i}": loss_i})
-            print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.6f}")
+        train_loss_summary.append(f"p{i}={loss_i:.6f}")
+        if global_rank == 0 and wandb is not None:
+            wandb.log({f"train/epochploss_{i}": loss_i})
+
+    if global_rank == 0:
+        rank_log(
+            f"TRAIN epoch={epoch+1}/{num_epochs} elapsed={epoch_elapsed:.0f}s "
+            f"acc=[{','.join(train_acc_summary)}] loss=[{','.join(train_loss_summary)}]"
+        )
 
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
     skipped_eval_batches = 0
     processed_eval_batches = 0
+    eval_t0 = time.perf_counter()
     prev_eval_loop_end = time.perf_counter()
 
-    for batch_idx, data in enumerate(tqdm(test_loader)):
+    for batch_idx, data in enumerate(test_loader):
         if max_eval_steps > 0 and batch_idx >= max_eval_steps:
             if global_rank == 0:
-                rank_log(f"Reached max_eval_steps={max_eval_steps}; stop eval early for diagnostics.")
+                rank_log(f"max_eval_steps={max_eval_steps} reached, stopping eval early")
             break
         processed_eval_batches += 1
         batch_begin = time.perf_counter()
         data_wait_sec = batch_begin - prev_eval_loop_end
         if data_wait_sec > slow_stage_seconds:
             rank_log(
-                f"SLOW stage=eval_dataloader_wait epoch={epoch} batch={batch_idx} wait={data_wait_sec:.3f}s",
+                f"SLOW eval_dataloader_wait epoch={epoch} batch={batch_idx} wait={data_wait_sec:.1f}s",
                 force_all_ranks=True,
             )
             maybe_dump_stall_diag("eval_dataloader_wait", epoch, batch_idx, data_wait_sec)
-            if global_stall_seconds > 0 and data_wait_sec >= global_stall_seconds:
-                global_stall_flag = torch.tensor(1, dtype=torch.int32, device=device)
-                deepspeed.comm.all_reduce(global_stall_flag, op=deepspeed.comm.ReduceOp.MIN)
-                if global_stall_flag.item() == 1:
-                    msg = (
-                        "suspected global process pause/preemption in eval: "
-                        f"all ranks saw dataloader_wait >= {global_stall_seconds}s "
-                        f"(epoch={epoch}, batch={batch_idx}, wait={data_wait_sec:.3f}s)"
-                    )
-                    rank_log("ERROR " + msg, force_all_ranks=True)
-                    if abort_on_global_stall:
-                        raise RuntimeError(msg)
+
+        if global_stall_seconds > 0 and data_wait_sec >= global_stall_seconds:
+            msg = (
+                f"eval dataloader stall: wait={data_wait_sec:.1f}s >= {global_stall_seconds}s "
+                f"(epoch={epoch}, batch={batch_idx})"
+            )
+            rank_log("ERROR " + msg, force_all_ranks=True)
+            if abort_on_global_stall:
+                raise RuntimeError(msg)
 
         with torch.no_grad():
-            stage_t0 = time.perf_counter()
             input_ids = data["input_ids"].to(device, non_blocking=True)
             attention_mask = data["attention_mask"].to(device, non_blocking=True)
             loss_mask = data["loss_mask"]
-            h2d_sec = time.perf_counter() - stage_t0
 
             stage_t0 = time.perf_counter()
             plosses, vlosses, acces = model_engine(
@@ -723,65 +817,46 @@ for epoch in range(start_epoch, num_epochs):
                 dtype=torch.int32,
                 device=device,
             )
-            stage_t0 = time.perf_counter()
             deepspeed.comm.all_reduce(model_nonfinite_flag, op=deepspeed.comm.ReduceOp.MAX)
-            allreduce_nonfinite_sec = time.perf_counter() - stage_t0
             if model_nonfinite_flag.item() > 0:
                 stage = getattr(model_engine.module, "_nonfinite_stage_this_step", "unknown")
-                if global_rank == 0:
-                    print(
-                        f"ERROR: non-finite tensor detected in eval forward "
-                        f"(epoch={epoch}, batch={batch_idx}, first_stage={stage})."
-                    )
+                rank_log(
+                    f"ERROR non-finite in eval forward epoch={epoch} batch={batch_idx} stage={stage}",
+                    force_all_ranks=True,
+                )
                 if os.environ.get("EAGLE_FAIL_FAST_ON_MODEL_NONFINITE", "1") == "1":
                     raise RuntimeError(
-                        "non-finite tensor detected in eval forward; aborting early to avoid NCCL timeout."
+                        f"non-finite tensor in eval forward (epoch={epoch}, batch={batch_idx}, stage={stage})"
                     )
             ploss_tensor = torch.stack([p.float() for p in plosses])
             bad_flag = (~torch.isfinite(ploss_tensor)).any().to(dtype=torch.int32)
-            stage_t0 = time.perf_counter()
             deepspeed.comm.all_reduce(bad_flag, op=deepspeed.comm.ReduceOp.MAX)
-            allreduce_badflag_sec = time.perf_counter() - stage_t0
             if bad_flag.item() > 0:
                 if global_rank == 0:
-                    print(f"WARN: non-finite eval ploss at epoch={epoch}, batch={batch_idx}; skip this batch")
+                    rank_log(f"WARN non-finite eval ploss epoch={epoch} batch={batch_idx}, skip")
                 skipped_eval_batches += 1
                 prev_eval_loop_end = time.perf_counter()
                 continue
             epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
             epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
-            iter_total_sec = time.perf_counter() - batch_begin
-            if (
-                h2d_sec > slow_stage_seconds
-                or forward_sec > slow_stage_seconds
-                or allreduce_nonfinite_sec > slow_stage_seconds
-                or allreduce_badflag_sec > slow_stage_seconds
-            ):
-                rank_log(
-                    f"SLOW eval epoch={epoch} batch={batch_idx} wait={data_wait_sec:.3f}s "
-                    f"h2d={h2d_sec:.3f}s fwd={forward_sec:.3f}s "
-                    f"ar_nonfinite={allreduce_nonfinite_sec:.3f}s ar_bad={allreduce_badflag_sec:.3f}s "
-                    f"iter={iter_total_sec:.3f}s",
-                    force_all_ranks=True,
-                )
-
             if batch_idx % heartbeat_steps == 0:
+                iter_total_sec = time.perf_counter() - batch_begin
                 rank_log(
                     f"HB-EVAL epoch={epoch} batch={batch_idx}/{len(test_loader)} "
-                    f"wait={data_wait_sec:.3f}s h2d={h2d_sec:.3f}s fwd={forward_sec:.3f}s "
-                    f"ar_nonfinite={allreduce_nonfinite_sec:.3f}s ar_bad={allreduce_badflag_sec:.3f}s "
-                    f"iter={iter_total_sec:.3f}s"
+                    f"fwd={forward_sec:.2f}s iter={iter_total_sec:.2f}s"
                 )
             prev_eval_loop_end = time.perf_counter()
 
+    eval_elapsed = time.perf_counter() - eval_t0
     if global_rank == 0 and skipped_eval_batches > 0:
-        print(f"WARN: skipped_eval_batches={skipped_eval_batches}/{processed_eval_batches}")
+        rank_log(f"WARN skipped_eval_batches={skipped_eval_batches}/{processed_eval_batches}")
     if processed_eval_batches == 0:
         raise RuntimeError("No eval batches were processed in this epoch; eval is invalid.")
     if skipped_eval_batches >= processed_eval_batches:
         raise RuntimeError("All eval batches were skipped due non-finite losses; eval is invalid.")
 
+    eval_acc_summary = []
     for i in range(len(epoch_acces)):
         if len(epoch_acces[i]) == 0:
             acc_i = torch.tensor(0.0, device=device)
@@ -791,11 +866,29 @@ for epoch in range(start_epoch, num_epochs):
             acc_i = acc_vals.mean()
         deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
         acc_i = acc_i.item()
-        if global_rank == 0:
-            if wandb is not None:
-                wandb.log({f"test/epochacc_{i}": acc_i})
-            print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.4f}")
+        eval_acc_summary.append(f"p{i}={acc_i:.4f}")
+        if global_rank == 0 and wandb is not None:
+            wandb.log({f"test/epochacc_{i}": acc_i})
 
+    # Estimate τ (chain-based lower bound): τ ≈ 1 + Σ Π(acc_0..acc_i)
+    acc_values = []
+    for i in range(len(epoch_acces)):
+        if len(epoch_acces[i]) == 0:
+            a = torch.tensor(0.0, device=device)
+        else:
+            a = torch.nan_to_num(
+                torch.tensor(epoch_acces[i], dtype=torch.float32, device=device),
+                nan=0.0, posinf=0.0, neginf=0.0,
+            ).mean()
+        deepspeed.comm.all_reduce(a, op=deepspeed.comm.ReduceOp.AVG)
+        acc_values.append(a.item())
+    tau_est = 1.0
+    prod = 1.0
+    for a in acc_values:
+        prod *= a
+        tau_est += prod
+
+    eval_loss_summary = []
     for i in range(len(epoch_plosses)):
         if len(epoch_plosses[i]) == 0:
             loss_i = torch.tensor(0.0, device=device)
@@ -805,10 +898,18 @@ for epoch in range(start_epoch, num_epochs):
             loss_i = loss_vals.mean()
         deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
         loss_i = loss_i.item()
-        if global_rank == 0:
-            if wandb is not None:
-                wandb.log({f"test/epochploss_{i}": loss_i})
-            print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.6f}")
+        eval_loss_summary.append(f"p{i}={loss_i:.6f}")
+        if global_rank == 0 and wandb is not None:
+            wandb.log({f"test/epochploss_{i}": loss_i})
+
+    if global_rank == 0:
+        if wandb is not None:
+            wandb.log({"test/tau_est": tau_est})
+        rank_log(
+            f"EVAL epoch={epoch+1}/{num_epochs} elapsed={eval_elapsed:.0f}s "
+            f"τ_est={tau_est:.2f} "
+            f"acc=[{','.join(eval_acc_summary)}] loss=[{','.join(eval_loss_summary)}]"
+        )
 
     # clear out the redundance cache after each epoch
     torch.cuda.empty_cache()

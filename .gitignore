@@ -43,3 +43,13 @@ EAGLE-main/eagle/data/
 **/*.pth
 **/*.bin
 **/*.onnx
+
+# =========================
+# Project-specific exclusions
+# =========================
+# Top-level training/eval datasets (ShareGPT etc., often hundreds of MB)
+/data/
+# Upstream EAGLE repo snapshot kept locally for reference only
+/EAGLE-main-original/
+# Editor settings
+.vscode/
